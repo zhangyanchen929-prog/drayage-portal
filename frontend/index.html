@@ -1,0 +1,251 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Drayage Portal</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link href="https://fonts.googleapis.com/css2?family=Barlow:wght@400;500;600;700&display=swap" rel="stylesheet" />
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <div class="app-shell">
+      <aside class="sidebar">
+        <div class="brand-wrap">
+          <div class="logo-box">D</div>
+          <div>
+            <div class="brand">DrayagePortal</div>
+            <div class="brand-sub">Vendor Workspace</div>
+          </div>
+        </div>
+        <nav id="nav-links">
+          <button class="nav-link active" data-page="overview"><span>◻</span>Overview</button>
+          <button class="nav-link" data-page="shipment"><span>◻</span>Shipment</button>
+          <button class="nav-link" data-page="empty-return"><span>◻</span>Empty Return</button>
+          <button class="nav-link" data-page="download-do"><span>◻</span>Download DO</button>
+          <button class="nav-link" data-page="upload-pod"><span>◻</span>Upload POD</button>
+          <button class="nav-link" data-page="tickets"><span>◻</span>Tickets</button>
+          <button class="nav-link" data-page="pricing"><span>◻</span>Pricing</button>
+        </nav>
+      </aside>
+      <main class="main">
+        <div id="app-error" class="empty hidden"></div>
+        <header class="top-bar">
+          <div></div>
+          <div class="top-right">
+            <span id="tz" class="pill">America/Los_Angeles</span>
+            <span id="email" class="pill">ops@example.com</span>
+            <span id="role-pill" class="pill hidden"></span>
+            <button id="logout-btn" class="btn-primary">Logout</button>
+          </div>
+        </header>
+
+        <section class="page active" id="page-overview">
+          <div class="section-head">
+            <div>
+          <h1>Overview</h1>
+          <p class="subtitle">Snapshot of your active shipments</p>
+            </div>
+            <button id="overview-refresh">Refresh</button>
+          </div>
+          <div id="overview-cards" class="cards"></div>
+          <div class="toolbar"><input id="overview-search" placeholder="Shipment ID / Container# / B/L / Terminal" /></div>
+          <div class="table-wrap"><table><thead><tr><th>Shipment ID</th><th>Container#</th><th>ETA</th><th>LFD</th><th>Status</th></tr></thead><tbody id="overview-table"></tbody></table></div>
+        </section>
+
+        <section class="page" id="page-shipment">
+          <div class="shipment-toolbar">
+            <div class="shipment-toolbar-top">
+              <input id="shipment-search" placeholder="Search: Shipment ID / Container# / B/L / Terminal / Deliver To / DO Status" />
+              <label><input type="checkbox" id="today-pickups" /> only show today pickups</label>
+              <label><input type="checkbox" id="nextday-pickups" /> only show Next-Day pickups</label>
+              <label><input type="checkbox" id="prep-pull" /> Pre-pull only</label>
+              <span class="sort-label">SORT</span>
+              <select id="shipment-sort">
+                <option value="lfd_asc">LFD↑</option>
+                <option value="status_priority">Status Priority</option>
+                <option value="pu_appt_asc">PU Appt↑</option>
+                <option value="sch_del_asc">Sch Del↑</option>
+                <option value="eta_asc">ETA↑</option>
+                <option value="empty_ret_asc">Empty Ret↑</option>
+                <option value="created_desc">CreatedAt↓</option>
+                <option value="terminal_az">Terminal A→Z</option>
+              </select>
+            </div>
+            <div class="shipment-toolbar-bottom">
+              <button id="shipment-refresh">Refresh</button>
+              <button id="new-shipment-btn">+ New Order</button>
+              <span id="shipment-status-tip" class="pill hidden"></span>
+              <button id="clear-shipment-status" class="ghost-btn hidden">Clear status filter</button>
+            </div>
+          </div>
+          <div class="table-wrap shipment-table-wrap"><table><thead><tr><th><input id="select-visible-shipments" type="checkbox" /></th><th>Shipment ID</th><th>Container#</th><th>Size</th><th>Terminal</th><th>ETA</th><th>LFD</th><th>Deliver To</th><th>PU Appt</th><th>Sch Del</th><th>Act Del</th><th>Empty Ret</th><th>Status</th><th>POD</th><th>Actions</th></tr></thead><tbody id="shipment-table"></tbody></table></div>
+        </section>
+
+        <section class="page" id="page-empty-return">
+          <h1>Empty Return</h1>
+          <div class="toolbar"><input id="empty-search" placeholder="Shipment ID / Container# / B/L / Terminal" /></div>
+          <div class="table-wrap"><table><thead><tr><th>Shipment ID</th><th>MB/L</th><th>Container#</th><th>Terminal</th><th>Deliver To</th><th>Delivered</th><th>Empty Date</th><th>Empty Returned</th><th>Status</th><th>Actions</th></tr></thead><tbody id="empty-table"></tbody></table></div>
+        </section>
+
+        <section class="page" id="page-download-do">
+          <h1>Download DO</h1>
+          <p class="subtitle">Batch download delivery shipments that are ready.</p>
+          <div class="toolbar grid3"><input id="do-search" placeholder="Shipment ID / Container# / Deliver To / File" /><div><button id="do-download-selected">Download Selected</button><button id="do-clear" class="ghost-btn">Clear</button></div><div>Selected: <span id="do-selected-count">0</span></div></div>
+          <div class="table-wrap"><table><thead><tr><th></th><th>Shipment ID</th><th>Container#</th><th>DO File</th><th>Actions</th></tr></thead><tbody id="do-table"></tbody></table></div>
+        </section>
+
+        <section class="page" id="page-upload-pod">
+          <h1>Upload POD</h1>
+          <div class="toolbar"><input id="pod-search" placeholder="Shipment ID / Container# / Terminal / Deliver To / DO Status" /></div>
+          <div id="pod-empty" class="empty hidden">No Dispatched shipments pending POD upload.</div>
+          <div class="table-wrap"><table><thead><tr><th>Shipment ID</th><th>Container#</th><th>B/L</th><th>Terminal</th><th>ETA</th><th>LFD</th><th>POD</th><th>Actions</th></tr></thead><tbody id="pod-table"></tbody></table></div>
+        </section>
+
+        <section class="page" id="page-tickets">
+          <h1>Tickets</h1>
+          <p class="subtitle">Report and track operational issues</p>
+          <div class="toolbar"><button id="new-ticket">New Ticket</button></div>
+          <div class="table-wrap"><table><thead><tr><th>Ticket#</th><th>Shipment ID</th><th>Category</th><th>Attachment</th><th>Status</th><th>Created</th></tr></thead><tbody id="ticket-table"></tbody></table></div>
+        </section>
+
+        <section class="page" id="page-pricing">
+          <h1>Pricing</h1>
+          <p class="subtitle">Vendor cost pool assigned to your account</p>
+          <div class="toolbar"><div><span id="pricing-count">0</span> rules</div><button id="pricing-refresh">Refresh</button></div>
+          <div class="table-wrap"><table><thead><tr><th>Priority</th><th>Code</th><th>Label</th><th>Calculator</th><th>Amount</th><th>Zone</th><th>Container</th><th>Free Days</th><th>Free Hours</th><th>Bill To</th></tr></thead><tbody id="pricing-table"></tbody></table></div>
+        </section>
+      </main>
+    </div>
+
+    <div id="detail-modal" class="modal hidden">
+      <div class="modal-card detail-card">
+        <div class="detail-head">
+          <div class="detail-head-left">
+            <div class="detail-icon">📄</div>
+            <div>
+              <h2>Shipment Detail</h2>
+              <div id="detail-subtitle" class="detail-subtitle"></div>
+            </div>
+          </div>
+          <div class="detail-head-right">
+            <span id="detail-status"></span>
+            <button type="button" class="ghost-btn" data-detail-close="1">✕</button>
+          </div>
+        </div>
+        <div id="detail-content"></div>
+      </div>
+    </div>
+
+    <div id="shipment-modal" class="modal hidden">
+      <div class="modal-card">
+        <div class="drawer-head">
+          <h2>New Order</h2>
+          <button type="button" id="shipment-modal-close" data-modal-close="1">Close</button>
+        </div>
+        <form id="shipment-form" class="form-grid">
+          <input id="f-shipment-id" placeholder="Shipment ID (required)" required />
+          <input id="f-container-no" placeholder="Container# (required)" required />
+          <input id="f-mbol" placeholder="B/L" />
+          <input id="f-size" placeholder="Size (e.g. 40HC)" value="40HC" />
+          <input id="f-terminal" placeholder="Terminal" />
+          <input id="f-carrier" placeholder="Carrier" />
+          <input id="f-eta" placeholder="ETA (YYYY-MM-DD HH:MM)" />
+          <input id="f-lfd" placeholder="LFD (YYYY-MM-DD HH:MM)" />
+          <input id="f-deliver-company" placeholder="Company" />
+          <input id="f-deliver-to" placeholder="Deliver To" />
+          <input id="f-contact" placeholder="Warehouse Contact" />
+          <input id="f-phone" placeholder="Warehouse Contact Phone" />
+          <input id="f-pickup-appt" placeholder="PU Appt (YYYY-MM-DD HH:MM)" />
+          <input id="f-sch-del" placeholder="Sch Del (YYYY-MM-DD HH:MM)" />
+          <select id="f-status">
+            <option value="awaiting_dispatch">Awaiting Dispatch</option>
+            <option value="pending">Pending</option>
+            <option value="scheduled">Scheduled</option>
+            <option value="exam_on_hold">Exam/On Hold</option>
+            <option value="pre_pull">Pre-pull</option>
+            <option value="dispatched">Dispatched</option>
+          </select>
+          <label><input type="checkbox" id="f-dg" /> DG</label>
+          <input id="f-remark" class="full" placeholder="Remark" />
+          <div class="full toolbar">
+            <button type="button" id="shipment-cancel-btn" data-modal-close="1" class="ghost-btn">Cancel</button>
+            <button type="submit">Create Order</button>
+          </div>
+        </form>
+      </div>
+    </div>
+
+    <div id="time-modal" class="modal hidden">
+      <div class="modal-card time-card">
+        <div class="drawer-head">
+          <h2>Update Times</h2>
+          <button type="button" data-time-close="1">Close</button>
+        </div>
+        <form id="time-form" class="form-grid">
+          <input id="time-shipment-id" class="full" placeholder="Shipment ID" readonly />
+          <label class="full" for="time-pu-appt">PU Appt</label>
+          <input id="time-pu-appt" class="full" type="datetime-local" />
+          <div class="full toolbar">
+            <button type="button" data-time-close="1" class="ghost-btn">Cancel</button>
+            <button type="submit">Save</button>
+          </div>
+        </form>
+      </div>
+    </div>
+
+    <section id="login-modal" class="login-screen hidden">
+      <header class="login-top">
+        <div class="login-brand">
+          <div class="logo-box">D</div>
+          <div>
+            <div class="login-brand-title">DrayagePortal</div>
+            <div class="login-brand-sub">Vendor Workspace</div>
+          </div>
+        </div>
+        <nav class="login-nav">
+          <a href="#">Home</a>
+          <a href="#">Solutions</a>
+          <a href="#">Services</a>
+          <a href="#">Ports</a>
+          <a href="#">About</a>
+          <a href="#">Contact</a>
+        </nav>
+        <div class="login-actions">
+          <button type="button" id="hero-signin-btn" class="login-link-btn">Login</button>
+          <button type="button" id="hero-quote-btn" class="btn-primary">Get Quote</button>
+        </div>
+      </header>
+      <div class="login-hero">
+        <div class="hero-copy">
+          <span class="hero-trust">Trusted by 200+ Operations Teams</span>
+          <h1 class="hero-title">Shipment <span>Visibility</span>, Unified Operations</h1>
+          <p class="hero-subtitle">
+            Manage DO, dispatch, POD, and empty return updates in one secure vendor portal.
+          </p>
+        </div>
+        <div class="hero-card-wrap">
+          <div class="hero-login-card">
+            <h2>Portal Login</h2>
+            <p>Sign in to your customer or operator workspace.</p>
+            <form id="login-form" class="form-grid">
+              <input id="login-email" class="full" type="email" placeholder="Email" required />
+              <input id="login-password" class="full" type="password" placeholder="Password" required />
+              <div id="login-error" class="full login-error hidden"></div>
+              <button class="full" type="submit">Login</button>
+              <div class="full login-demo">
+                Demo:
+                customer@demo.com / customer123
+                <br />
+                operator@demo.com / operator123
+              </div>
+            </form>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <script src="/app.js"></script>
+  </body>
+</html>

@@ -1,0 +1,101 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Ops Portal - Orders</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Barlow:wght@400;500;600;700&display=swap"
+      rel="stylesheet"
+    />
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <div class="app">
+      <aside class="sidebar">
+        <div class="brand">
+          <span class="brand-dot"></span>
+          <div>
+            <h1>DRAY OPS</h1>
+            <p>Control Panel</p>
+          </div>
+        </div>
+        <nav>
+          <a href="#" class="nav-item">Dashboard</a>
+          <a href="#" class="nav-item active">Orders</a>
+          <a href="#" class="nav-item">Fleet</a>
+          <a href="#" class="nav-item">Drivers</a>
+          <a href="#" class="nav-item">Billing</a>
+          <a href="#" class="nav-item">Settings</a>
+        </nav>
+      </aside>
+
+      <main class="main">
+        <header class="topbar">
+          <div>
+            <h2>Orders</h2>
+            <p>Track, dispatch, and monitor active jobs</p>
+          </div>
+          <button class="primary-btn">+ Create Order</button>
+        </header>
+
+        <section class="stats-grid">
+          <article class="stat-card">
+            <p>Active Orders</p>
+            <h3 id="active-count">0</h3>
+          </article>
+          <article class="stat-card">
+            <p>In Transit</p>
+            <h3 id="transit-count">0</h3>
+          </article>
+          <article class="stat-card">
+            <p>Delayed</p>
+            <h3 id="delayed-count">0</h3>
+          </article>
+          <article class="stat-card">
+            <p>Completed Today</p>
+            <h3 id="completed-count">0</h3>
+          </article>
+        </section>
+
+        <section class="panel">
+          <div class="panel-toolbar">
+            <input id="search-input" type="text" placeholder="Search order / customer / container..." />
+            <select id="status-filter">
+              <option value="all">All Status</option>
+              <option value="Queued">Queued</option>
+              <option value="In Transit">In Transit</option>
+              <option value="Delayed">Delayed</option>
+              <option value="Completed">Completed</option>
+            </select>
+          </div>
+
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>Order ID</th>
+                  <th>Customer</th>
+                  <th>Container</th>
+                  <th>Pickup</th>
+                  <th>Dropoff</th>
+                  <th>ETA</th>
+                  <th>Status</th>
+                </tr>
+              </thead>
+              <tbody id="orders-body"></tbody>
+            </table>
+          </div>
+          <div class="pagination">
+            <button id="prev-page">Prev</button>
+            <span id="page-label">Page 1</span>
+            <button id="next-page">Next</button>
+          </div>
+        </section>
+      </main>
+    </div>
+    <script src="./app.js"></script>
+  </body>
+</html>
