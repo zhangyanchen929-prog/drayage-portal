@@ -1,0 +1,624 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Gmail Delivery Order Extractor</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;600&family=Syne:wght@400;700;800&display=swap" rel="stylesheet">
+  <style>
+    :root {
+      --bg: #0b0f18;
+      --surface: #151a27;
+      --surface2: #1d2437;
+      --border: #2f3750;
+      --text: #e9edf6;
+      --muted: #8992ab;
+      --accent: #00e5ff;
+      --ok: #00c896;
+      --err: #ff4d6d;
+      --mono: "IBM Plex Mono", monospace;
+      --sans: "Syne", sans-serif;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      padding: 28px;
+      color: var(--text);
+      background:
+        radial-gradient(100% 55% at 50% -20%, rgba(0,229,255,0.12), transparent 60%),
+        linear-gradient(180deg, #0b0f18 0%, #0e1320 100%);
+      font-family: var(--sans);
+      min-height: 100vh;
+    }
+    .wrap { max-width: 980px; margin: 0 auto; }
+    .panel {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      padding: 18px;
+      margin-bottom: 14px;
+    }
+    h1 { margin: 0 0 6px; font-size: 1.6rem; }
+    .sub { color: var(--muted); font-size: .85rem; font-family: var(--mono); }
+    .row { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; }
+    button {
+      border: 1px solid var(--border);
+      background: var(--surface2);
+      color: var(--text);
+      border-radius: 8px;
+      padding: 10px 14px;
+      font-family: var(--mono);
+      font-size: .8rem;
+      cursor: pointer;
+    }
+    button.primary {
+      background: linear-gradient(135deg, var(--accent), #0ea5e9);
+      color: #001018;
+      border: none;
+      font-weight: 700;
+    }
+    button:disabled { opacity: .5; cursor: not-allowed; }
+    .pill {
+      display: inline-block;
+      border: 1px solid var(--border);
+      border-radius: 999px;
+      padding: 5px 10px;
+      font-size: .72rem;
+      font-family: var(--mono);
+      color: var(--muted);
+    }
+    input {
+      width: 100%;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      background: var(--surface2);
+      color: var(--text);
+      padding: 10px 12px;
+      font-family: var(--mono);
+      font-size: .8rem;
+    }
+    select {
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      background: var(--surface2);
+      color: var(--text);
+      padding: 10px 12px;
+      font-family: var(--mono);
+      font-size: .8rem;
+    }
+    table { width: 100%; border-collapse: collapse; font-family: var(--mono); font-size: .78rem; }
+    th, td { border-bottom: 1px solid var(--border); text-align: left; padding: 10px 8px; vertical-align: top; }
+    th { color: var(--muted); font-weight: 600; }
+    .status { margin-top: 10px; font-family: var(--mono); font-size: .78rem; }
+    .ok { color: var(--ok); }
+    .err { color: var(--err); }
+    .grid { display: grid; gap: 8px; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); }
+    .card { background: var(--surface2); border: 1px solid var(--border); border-radius: 8px; padding: 10px; }
+    .label { color: var(--muted); font-size: .68rem; font-family: var(--mono); text-transform: uppercase; }
+    .value { margin-top: 4px; font-size: .95rem; }
+    pre {
+      margin: 0;
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      background: #0f1524;
+      padding: 12px;
+      overflow: auto;
+      max-height: 420px;
+      font-size: .76rem;
+      color: #b8c5e0;
+      font-family: var(--mono);
+    }
+    @media (max-width: 768px) { body { padding: 16px; } }
+  </style>
+</head>
+<body>
+<div class="wrap">
+  <section class="panel">
+    <h1>Gmail Delivery Order Extractor</h1>
+    <div class="sub">登录 Google 后，直接读取 Gmail 里的 DO PDF 并抽取为 JSON</div>
+    <div class="row" style="margin-top:12px">
+      <span class="pill" id="account-pill">未连接 Gmail</span>
+      <button class="primary" id="connect-btn">Sign in with Google</button>
+      <button id="logout-btn" disabled>Disconnect</button>
+    </div>
+    <div class="status" id="session-status"></div>
+  </section>
+
+  <section class="panel">
+    <div class="sub" style="margin-bottom:8px">Gmail Search Query</div>
+    <div class="row">
+      <input id="query-input" value='in:anywhere has:attachment (subject:(DO OR "delivery order" OR 提柜预报) OR filename:(DO OR Delivery_Order)) newer_than:1d'>
+      <select id="limit-select" title="Number of emails to load">
+        <option value="14" selected>14</option>
+        <option value="10">10</option>
+        <option value="50">50</option>
+        <option value="100">100</option>
+        <option value="200">200</option>
+      </select>
+      <button id="load-btn">Load Emails</button>
+    </div>
+    <div class="row" style="margin-top:8px;">
+      <button id="range-1">1D</button>
+      <button id="range-3">3D</button>
+      <button id="range-7">7D</button>
+      <button id="range-14">14D</button>
+    </div>
+    <div class="status" id="list-status"></div>
+    <div style="margin-top:10px; overflow:auto;">
+      <table>
+        <thead>
+          <tr><th>Subject</th><th>From</th><th>Date</th><th>PDF</th><th>Action</th></tr>
+        </thead>
+        <tbody id="msg-table"></tbody>
+      </table>
+    </div>
+    <div class="row" id="pager-wrap" style="margin-top:10px; display:none;">
+      <button id="pager-prev">Prev</button>
+      <span class="sub" id="pager-info">Page 1 / 1</span>
+      <button id="pager-next">Next</button>
+    </div>
+  </section>
+
+  <section class="panel">
+    <div class="row" style="justify-content:space-between; margin-bottom:10px">
+      <div class="sub">Extracted Result</div>
+      <div class="row">
+        <button id="push-sheet-btn" disabled>Push To Sheet</button>
+        <button id="raw-btn" disabled>Show Raw Text</button>
+        <button id="copy-btn" disabled>Copy JSON</button>
+        <button id="download-btn" disabled>Download JSON</button>
+      </div>
+    </div>
+    <div class="row" style="margin-bottom:10px;">
+      <input id="sheet-url-input" value="https://docs.google.com/spreadsheets/d/1FFaG6Y6scX1pZr-dTWnN1KBUGZKVhtPMw22OR3TFWF0/edit?gid=0#gid=0" placeholder="Google Sheet URL or Sheet ID">
+      <input id="sheet-name-input" value="Sheet1" placeholder="Sheet name (tab)">
+    </div>
+    <div class="row" style="margin-bottom:10px;">
+      <input id="routing-input" value="pegaso=Sheet1, vail=Sheet2" placeholder="Routing rules: customer=sheet, e.g. pegaso=Sheet1, vail=Sheet2">
+    </div>
+    <div class="status" id="sheet-status"></div>
+    <div class="grid" id="summary-grid" style="display:none">
+      <div class="card"><div class="label">Shipment Ref</div><div class="value" id="s-ref">-</div></div>
+      <div class="card"><div class="label">Vessel</div><div class="value" id="s-vessel">-</div></div>
+      <div class="card"><div class="label">Arrival</div><div class="value" id="s-arrival">-</div></div>
+      <div class="card"><div class="label">Containers</div><div class="value" id="s-count">-</div></div>
+      <div class="card"><div class="label">Deliver To</div><div class="value" id="s-deliver">-</div></div>
+      <div class="card"><div class="label">Weight KG</div><div class="value" id="s-weight">-</div></div>
+    </div>
+    <div class="status" id="process-status"></div>
+    <div class="sub" id="result-list-label" style="display:none; margin:8px 0 6px;">Attachments in this email</div>
+    <div class="row" id="result-list" style="display:none; margin-bottom:10px;"></div>
+    <pre id="raw-box" style="display:none; margin-bottom:10px"></pre>
+    <pre id="json-box">{}</pre>
+  </section>
+</div>
+
+<script>
+  let lastJson = null;
+  let lastRawText = "";
+  let lastAttachmentResults = [];
+  let lastLoadedRows = [];
+  let currentMessageId = "";
+  let currentPage = 1;
+  const PAGE_SIZE = 10;
+  const PUSHED_STORE_KEY = "gmail_do_sheet_pushed_v1";
+
+  function loadPushedMap() {
+    try {
+      return JSON.parse(localStorage.getItem(PUSHED_STORE_KEY) || "{}");
+    } catch (_) {
+      return {};
+    }
+  }
+
+  function savePushedMap(map) {
+    localStorage.setItem(PUSHED_STORE_KEY, JSON.stringify(map));
+  }
+
+  function extractSheetId(value) {
+    const raw = (value || "").trim();
+    const m = raw.match(/\/spreadsheets\/d\/([a-zA-Z0-9-_]+)/);
+    return m ? m[1] : raw;
+  }
+
+  function pushedKey(messageId) {
+    const sheetId = extractSheetId(document.getElementById("sheet-url-input").value.trim());
+    return sheetId + "::" + messageId;
+  }
+
+  function getMessageById(messageId) {
+    return (lastLoadedRows || []).find((x) => x.id === messageId) || null;
+  }
+
+  function parseRoutingRules(raw) {
+    const out = [];
+    const text = (raw || "").trim();
+    if (!text) return out;
+    text.split(",").forEach((part) => {
+      const seg = part.trim();
+      if (!seg) return;
+      const idx = seg.indexOf("=");
+      if (idx <= 0) return;
+      const key = seg.slice(0, idx).trim().toLowerCase();
+      const sheet = seg.slice(idx + 1).trim();
+      if (key && sheet) out.push({ key, sheet });
+    });
+    return out;
+  }
+
+  function chooseSheetByRules(messageId, attachments, defaultSheetName) {
+    const msg = getMessageById(messageId);
+    const blocks = [];
+    if (msg) {
+      blocks.push(msg.subject || "");
+      blocks.push(msg.from || "");
+      blocks.push(msg.snippet || "");
+    }
+    (attachments || []).forEach((att) => {
+      const d = (((att || {}).result || {}).delivery_order) || {};
+      blocks.push(d.shipment_reference || "");
+      blocks.push((((d.deliver_to || {}).company) || ""));
+      blocks.push((((d.issued_by || {}).company) || ""));
+    });
+    const haystack = blocks.join(" ").toLowerCase();
+    const rules = parseRoutingRules(document.getElementById("routing-input").value);
+    for (const r of rules) {
+      if (haystack.includes(r.key)) return { sheetName: r.sheet, matched: r.key };
+    }
+    return { sheetName: defaultSheetName, matched: "" };
+  }
+
+  function isMessagePushed(messageId) {
+    const map = loadPushedMap();
+    return !!map[pushedKey(messageId)];
+  }
+
+  function markMessagePushed(messageId, meta) {
+    const map = loadPushedMap();
+    map[pushedKey(messageId)] = {
+      at: new Date().toISOString(),
+      rows: meta?.rows || 0
+    };
+    savePushedMap(map);
+  }
+
+  function renderMessageTable() {
+    const tbody = document.getElementById("msg-table");
+    const pagerWrap = document.getElementById("pager-wrap");
+    const pagerInfo = document.getElementById("pager-info");
+    const prevBtn = document.getElementById("pager-prev");
+    const nextBtn = document.getElementById("pager-next");
+
+    const total = lastLoadedRows.length;
+    const totalPages = Math.max(1, Math.ceil(total / PAGE_SIZE));
+    if (currentPage > totalPages) currentPage = totalPages;
+    if (currentPage < 1) currentPage = 1;
+    const start = (currentPage - 1) * PAGE_SIZE;
+    const pageRows = lastLoadedRows.slice(start, start + PAGE_SIZE);
+
+    tbody.innerHTML = pageRows.map((row) => `
+      <tr>
+        <td>${escapeHtml(row.subject || "")}<div class="sub">${escapeHtml(row.snippet || "")}</div></td>
+        <td>${escapeHtml(row.from || "")}</td>
+        <td>${escapeHtml(row.date || "")}</td>
+        <td>${row.pdf_count || 0}<div class="sub">${escapeHtml((row.pdf_files || []).join(", "))}</div></td>
+        <td>
+          <div class="row">
+            <button onclick="processMessage('${row.id}')">Extract</button>
+          </div>
+          <div class="sub ${isMessagePushed(row.id) ? "ok" : ""}" id="pushed-${row.id}" style="margin-top:6px;">
+            ${isMessagePushed(row.id) ? "Added to Sheet" : ""}
+          </div>
+        </td>
+      </tr>
+    `).join("");
+
+    if (total > PAGE_SIZE) {
+      pagerWrap.style.display = "flex";
+      pagerInfo.textContent = `Page ${currentPage} / ${totalPages} (Total ${total})`;
+      prevBtn.disabled = currentPage <= 1;
+      nextBtn.disabled = currentPage >= totalPages;
+    } else {
+      pagerWrap.style.display = "none";
+      pagerInfo.textContent = "Page 1 / 1";
+      prevBtn.disabled = true;
+      nextBtn.disabled = true;
+    }
+  }
+
+  async function api(path, options = {}) {
+    const res = await fetch(path, options);
+    const text = await res.text();
+    let data = {};
+    if (text) {
+      try {
+        data = JSON.parse(text);
+      } catch (_) {
+        data = {};
+      }
+    }
+    if (!res.ok) throw new Error((data && data.detail) || text || ("HTTP " + res.status));
+    return data;
+  }
+
+  function setStatus(id, msg, kind = "") {
+    const el = document.getElementById(id);
+    el.className = "status " + kind;
+    el.textContent = msg;
+  }
+
+  async function loadSession() {
+    const data = await api("/gmail/session");
+    const connected = !!data.authenticated;
+    document.getElementById("account-pill").textContent = connected ? ("Connected: " + (data.email || "")) : "未连接 Gmail";
+    document.getElementById("logout-btn").disabled = !connected;
+    setStatus("session-status", connected ? "已连接，可加载邮件。" : "请先登录 Google。", connected ? "ok" : "");
+    return connected;
+  }
+
+  async function connectGoogle() {
+    try {
+      const data = await api("/gmail/auth/start");
+      window.location.href = data.auth_url;
+    } catch (err) {
+      setStatus("session-status", err.message, "err");
+    }
+  }
+
+  async function logoutGoogle() {
+    await api("/gmail/logout", { method: "POST" });
+    await loadSession();
+    document.getElementById("msg-table").innerHTML = "";
+    document.getElementById("json-box").textContent = "{}";
+    document.getElementById("raw-box").textContent = "";
+    document.getElementById("raw-box").style.display = "none";
+    document.getElementById("summary-grid").style.display = "none";
+    document.getElementById("result-list-label").style.display = "none";
+    document.getElementById("result-list").style.display = "none";
+    document.getElementById("result-list").innerHTML = "";
+    document.getElementById("sheet-status").textContent = "";
+    document.getElementById("push-sheet-btn").disabled = true;
+    document.getElementById("raw-btn").disabled = true;
+    document.getElementById("copy-btn").disabled = true;
+    document.getElementById("download-btn").disabled = true;
+  }
+
+  function escapeHtml(v) {
+    return (v || "").replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;");
+  }
+
+  async function loadMessages() {
+    const q = document.getElementById("query-input").value.trim();
+    const limit = Number(document.getElementById("limit-select").value || "100");
+    setStatus("list-status", "Loading emails...");
+    try {
+      const data = await api(
+        "/gmail/messages?q=" + encodeURIComponent(q) +
+        "&max_results=" + encodeURIComponent(String(limit)) +
+        "&incoming_only=1"
+      );
+      const rows = data.items || [];
+      lastLoadedRows = rows;
+      currentPage = 1;
+      renderMessageTable();
+      setStatus("list-status", "Loaded " + rows.length + " email(s).", "ok");
+    } catch (err) {
+      setStatus("list-status", err.message, "err");
+    }
+  }
+
+  function setRange(days) {
+    const input = document.getElementById("query-input");
+    let q = input.value.trim();
+    q = q.replace(/\s*newer_than:\d+d/gi, "").trim();
+    if (days === "all") {
+      input.value = q;
+      return;
+    }
+    input.value = (q + " newer_than:" + days + "d").trim();
+  }
+
+  async function setRangeAndReload(days) {
+    setRange(days);
+    await loadMessages();
+  }
+
+  function updateSummary(jsonObj) {
+    const d = (((jsonObj || {}).delivery_order) || {});
+    const containers = d.containers || [];
+    const totalKg = containers.reduce((sum, c) => sum + (Number(c.weight_kg) || 0), 0);
+    document.getElementById("s-ref").textContent = d.shipment_reference || "-";
+    document.getElementById("s-vessel").textContent = ((d.shipment || {}).vessel_name) || "-";
+    document.getElementById("s-arrival").textContent = ((d.shipment || {}).arrival_date) || "-";
+    document.getElementById("s-count").textContent = containers.length + " container(s)";
+    document.getElementById("s-deliver").textContent = ((d.deliver_to || {}).company) || "-";
+    document.getElementById("s-weight").textContent = totalKg.toLocaleString() + " KG";
+    document.getElementById("summary-grid").style.display = "grid";
+  }
+
+  function showResultByIndex(index) {
+    const item = lastAttachmentResults[index];
+    if (!item || !item.result) return;
+    lastJson = item.result;
+    lastRawText = item.debug_text || "";
+    document.getElementById("json-box").textContent = JSON.stringify(lastJson, null, 2);
+    document.getElementById("raw-box").textContent = lastRawText || "(No text extracted from this PDF)";
+    document.getElementById("raw-box").style.display = "none";
+    document.getElementById("raw-btn").textContent = "Show Raw Text";
+    updateSummary(lastJson);
+    document.getElementById("raw-btn").disabled = false;
+    document.getElementById("copy-btn").disabled = false;
+    document.getElementById("download-btn").disabled = false;
+
+    document.querySelectorAll("[data-result-index]").forEach((btn) => {
+      const active = Number(btn.getAttribute("data-result-index")) === index;
+      btn.classList.toggle("primary", active);
+    });
+  }
+
+  function renderResultList(items) {
+    const wrap = document.getElementById("result-list");
+    const label = document.getElementById("result-list-label");
+    if (!items.length) {
+      wrap.style.display = "none";
+      label.style.display = "none";
+      wrap.innerHTML = "";
+      return;
+    }
+
+    wrap.innerHTML = items.map((item, idx) => {
+      const ok = !!item.result;
+      const suffix = ok ? "" : " (failed)";
+      return `<button data-result-index="${idx}" ${ok ? "" : "disabled"}>${(item.filename || ("attachment_" + (idx + 1))) + suffix}</button>`;
+    }).join("");
+    wrap.style.display = "flex";
+    label.style.display = "block";
+    wrap.querySelectorAll("[data-result-index]").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        showResultByIndex(Number(btn.getAttribute("data-result-index")));
+      });
+    });
+  }
+
+  async function processMessage(messageId) {
+    currentMessageId = messageId;
+    setStatus("process-status", "Processing PDF attachments...");
+    try {
+      const data = await api("/gmail/process", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ message_id: messageId })
+      });
+      const items = data.attachments || [];
+      lastAttachmentResults = items;
+      renderResultList(items);
+      const successItem = items.find((x) => x.result);
+      if (!successItem) {
+        throw new Error("No successful extraction. " + JSON.stringify(items));
+      }
+      const firstSuccessIndex = items.findIndex((x) => x.result);
+      showResultByIndex(firstSuccessIndex);
+      document.getElementById("push-sheet-btn").disabled = !items.some((x) => x.result);
+      const okCount = items.filter((x) => x.result).length;
+      const failCount = items.length - okCount;
+      setStatus(
+        "process-status",
+        "Done: " + okCount + " success, " + failCount + " failed.",
+        failCount ? "err" : "ok"
+      );
+    } catch (err) {
+      setStatus("process-status", err.message, "err");
+    }
+  }
+
+  function copyJson() {
+    if (!lastJson) return;
+    navigator.clipboard.writeText(JSON.stringify(lastJson, null, 2));
+  }
+
+  function downloadJson() {
+    if (!lastJson) return;
+    const ref = (((lastJson || {}).delivery_order || {}).shipment_reference) || "delivery_order";
+    const blob = new Blob([JSON.stringify(lastJson, null, 2)], { type: "application/json" });
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = "delivery_order_" + ref + ".json";
+    a.click();
+  }
+
+  async function pushToSheet() {
+    const sheetIdOrUrl = document.getElementById("sheet-url-input").value.trim();
+    const defaultSheetName = document.getElementById("sheet-name-input").value.trim() || "Sheet1";
+    const attachments = lastAttachmentResults.filter((x) => x.result);
+    if (!currentMessageId) {
+      setStatus("sheet-status", "Please extract one email first.", "err");
+      return;
+    }
+    if (!sheetIdOrUrl) {
+      setStatus("sheet-status", "Please provide Google Sheet URL or ID.", "err");
+      return;
+    }
+    if (isMessagePushed(currentMessageId)) {
+      setStatus("sheet-status", "This email is already added to the current sheet.", "err");
+      return;
+    }
+    if (!attachments.length) {
+      setStatus("sheet-status", "No successful extracted results to push.", "err");
+      return;
+    }
+    const route = chooseSheetByRules(currentMessageId, attachments, defaultSheetName);
+    const sheetName = route.sheetName;
+    setStatus("sheet-status", "Pushing rows to Google Sheet...");
+    try {
+      const data = await api("/sheets/append", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          sheet_id_or_url: sheetIdOrUrl,
+          sheet_name: sheetName,
+          attachments
+        })
+      });
+      const routeNote = route.matched ? (" (routed by: " + route.matched + ")") : "";
+      setStatus("sheet-status", "Sheet updated: " + data.rows_appended + " row(s) appended to " + data.sheet_name + routeNote + ".", "ok");
+      markMessagePushed(currentMessageId, { rows: data.rows_appended || 0 });
+      const marker = document.getElementById("pushed-" + currentMessageId);
+      if (marker) {
+        marker.textContent = "Added to Sheet";
+        marker.classList.add("ok");
+      }
+      renderMessageTable();
+    } catch (err) {
+      setStatus("sheet-status", err.message, "err");
+    }
+  }
+
+  function toggleRawText() {
+    const box = document.getElementById("raw-box");
+    const btn = document.getElementById("raw-btn");
+    if (box.style.display === "none") {
+      box.style.display = "block";
+      btn.textContent = "Hide Raw Text";
+      return;
+    }
+    box.style.display = "none";
+    btn.textContent = "Show Raw Text";
+  }
+
+  document.getElementById("connect-btn").addEventListener("click", connectGoogle);
+  document.getElementById("logout-btn").addEventListener("click", logoutGoogle);
+  document.getElementById("load-btn").addEventListener("click", loadMessages);
+  document.getElementById("sheet-url-input").addEventListener("change", () => {
+    if (!lastLoadedRows.length) return;
+    renderMessageTable();
+  });
+  document.getElementById("pager-prev").addEventListener("click", () => {
+    if (currentPage <= 1) return;
+    currentPage -= 1;
+    renderMessageTable();
+  });
+  document.getElementById("pager-next").addEventListener("click", () => {
+    const totalPages = Math.max(1, Math.ceil(lastLoadedRows.length / PAGE_SIZE));
+    if (currentPage >= totalPages) return;
+    currentPage += 1;
+    renderMessageTable();
+  });
+  document.getElementById("range-1").addEventListener("click", () => setRangeAndReload(1));
+  document.getElementById("range-3").addEventListener("click", () => setRangeAndReload(3));
+  document.getElementById("range-7").addEventListener("click", () => setRangeAndReload(7));
+  document.getElementById("range-14").addEventListener("click", () => setRangeAndReload(14));
+  document.getElementById("push-sheet-btn").addEventListener("click", pushToSheet);
+  document.getElementById("raw-btn").addEventListener("click", toggleRawText);
+  document.getElementById("copy-btn").addEventListener("click", copyJson);
+  document.getElementById("download-btn").addEventListener("click", downloadJson);
+
+  loadSession().catch((err) => setStatus("session-status", err.message, "err"));
+  if (window.location.search.includes("connected=1")) {
+    setStatus("session-status", "Google account connected.", "ok");
+    window.history.replaceState({}, document.title, "/gmail-do");
+  }
+</script>
+</body>
+</html>

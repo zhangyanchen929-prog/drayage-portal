@@ -2,21 +2,31 @@ from __future__ import annotations
 
 import sqlite3
 import zipfile
+import base64
+import io
 from datetime import datetime
 from datetime import timedelta
 import hashlib
+import json
+import os
+import re
 from pathlib import Path
 import secrets
 from typing import Any
+import urllib.error
+import urllib.parse
+import urllib.request
 
 from fastapi import FastAPI, File, HTTPException, UploadFile, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from backend.db import UPLOAD_DIR, get_conn, init_db
+from backend.email_extractor import anthropic_extract
 from backend.seed import seed_data
+from pypdf import PdfReader
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 FRONTEND_DIR = BASE_DIR / "frontend"
@@ -48,6 +58,10 @@ DISPLAY_STATUS = {
     "empty_returned": "Empty Returned",
     "closed": "Closed",
 }
+
+GMAIL_COOKIE_NAME = "gmail_do_sid"
+GMAIL_SESSION_TTL_SECONDS = 86400
+GMAIL_OAUTH_SESSIONS: dict[str, dict[str, Any]] = {}
 
 
 class TicketCreate(BaseModel):
@@ -90,6 +104,25 @@ class LoginRequest(BaseModel):
     password: str
 
 
+class RegisterRequest(BaseModel):
+    email: str
+    password: str
+
+
+class UserRoleUpdate(BaseModel):
+    role: str
+
+
+class GmailProcessRequest(BaseModel):
+    message_id: str
+
+
+class SheetAppendRequest(BaseModel):
+    sheet_id_or_url: str
+    sheet_name: str = "Sheet1"
+    attachments: list[dict[str, Any]]
+
+
 app = FastAPI(title="Drayage Portal API", version="0.1.0")
 app.add_middleware(
     CORSMiddleware,
@@ -103,6 +136,12 @@ app.add_middleware(
 @app.on_event("startup")
 def startup() -> None:
     init_db()
+    with get_conn() as conn:
+        cols = {r["name"] for r in conn.execute("PRAGMA table_info(shipments)").fetchall()}
+        if "owner_user_id" not in cols:
+            conn.execute("ALTER TABLE shipments ADD COLUMN owner_user_id INTEGER")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_shipments_owner_user_id ON shipments(owner_user_id)")
+        conn.commit()
     seed_data()
 
 
@@ -124,16 +163,514 @@ def require_role(request: Request, roles: set[str]) -> dict[str, Any]:
     return user
 
 
+def shipment_scope(user: dict[str, Any]) -> tuple[str, list[Any]]:
+    if user["role"] == "customer":
+        return "owner_user_id = ?", [user["id"]]
+    return "1=1", []
+
+
+def gmail_env(name: str, default: str | None = None, required: bool = False) -> str:
+    value = os.getenv(name, default)
+    if required and (value is None or value.strip() == ""):
+        raise HTTPException(500, f"Missing environment variable: {name}")
+    return value or ""
+
+
+def cleanup_gmail_sessions() -> None:
+    now_ts = datetime.utcnow().timestamp()
+    stale = [
+        sid
+        for sid, session in GMAIL_OAUTH_SESSIONS.items()
+        if now_ts - session.get("created_at_ts", now_ts) > GMAIL_SESSION_TTL_SECONDS
+    ]
+    for sid in stale:
+        GMAIL_OAUTH_SESSIONS.pop(sid, None)
+
+
+def get_or_create_gmail_session(request: Request) -> tuple[str, dict[str, Any], bool]:
+    cleanup_gmail_sessions()
+    sid = request.cookies.get(GMAIL_COOKIE_NAME, "")
+    if sid and sid in GMAIL_OAUTH_SESSIONS:
+        session = GMAIL_OAUTH_SESSIONS[sid]
+        return sid, session, False
+
+    sid = secrets.token_urlsafe(24)
+    session = {"created_at_ts": datetime.utcnow().timestamp()}
+    GMAIL_OAUTH_SESSIONS[sid] = session
+    return sid, session, True
+
+
+def set_gmail_cookie(response: JSONResponse | RedirectResponse, sid: str) -> None:
+    response.set_cookie(
+        key=GMAIL_COOKIE_NAME,
+        value=sid,
+        httponly=True,
+        samesite="lax",
+        secure=False,
+        max_age=GMAIL_SESSION_TTL_SECONDS,
+    )
+
+
+def google_token_request(form_data: dict[str, str]) -> dict[str, Any]:
+    payload = urllib.parse.urlencode(form_data).encode("utf-8")
+    req = urllib.request.Request(
+        url="https://oauth2.googleapis.com/token",
+        method="POST",
+        data=payload,
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        body = exc.read().decode("utf-8", errors="replace")
+        raise HTTPException(400, f"Google token exchange failed: {body}") from exc
+
+
+def refresh_google_access_token(session: dict[str, Any]) -> None:
+    refresh_token = session.get("refresh_token", "")
+    if not refresh_token:
+        raise HTTPException(401, "Google session expired. Please reconnect.")
+
+    token_data = google_token_request(
+        {
+            "client_id": gmail_env("GOOGLE_CLIENT_ID", required=True),
+            "client_secret": gmail_env("GOOGLE_CLIENT_SECRET", required=True),
+            "refresh_token": refresh_token,
+            "grant_type": "refresh_token",
+        }
+    )
+    session["access_token"] = token_data.get("access_token", "")
+    session["expires_at_ts"] = datetime.utcnow().timestamp() + int(token_data.get("expires_in", 3600)) - 30
+    if not session["access_token"]:
+        raise HTTPException(401, "Unable to refresh Google access token.")
+
+
+def get_google_access_token(session: dict[str, Any]) -> str:
+    access_token = session.get("access_token", "")
+    expires_at_ts = float(session.get("expires_at_ts", 0))
+    if not access_token or datetime.utcnow().timestamp() >= expires_at_ts:
+        refresh_google_access_token(session)
+    return session.get("access_token", "")
+
+
+def gmail_api_request(
+    session: dict[str, Any],
+    url: str,
+    method: str = "GET",
+    body: dict[str, Any] | None = None,
+    retry_on_401: bool = True,
+) -> dict[str, Any]:
+    token = get_google_access_token(session)
+    data_bytes = json.dumps(body).encode("utf-8") if body is not None else None
+    req = urllib.request.Request(
+        url=url,
+        method=method,
+        data=data_bytes,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            raw = resp.read().decode("utf-8")
+            return json.loads(raw) if raw else {}
+    except urllib.error.HTTPError as exc:
+        if exc.code == 401 and retry_on_401:
+            refresh_google_access_token(session)
+            return gmail_api_request(session, url, method=method, body=body, retry_on_401=False)
+        body_text = exc.read().decode("utf-8", errors="replace")
+        raise HTTPException(exc.code, f"Gmail API request failed: {body_text}") from exc
+
+
+def get_gmail_profile(session: dict[str, Any]) -> dict[str, Any]:
+    return gmail_api_request(session, "https://gmail.googleapis.com/gmail/v1/users/me/profile")
+
+
+def collect_pdf_parts(part: dict[str, Any], out: list[dict[str, Any]]) -> None:
+    mime_type = (part.get("mimeType") or "").lower()
+    filename = part.get("filename") or ""
+    body = part.get("body") or {}
+    attachment_id = body.get("attachmentId")
+    inline_data = body.get("data")
+    if mime_type == "application/pdf" or filename.lower().endswith(".pdf"):
+        out.append(
+            {
+                "filename": filename or "attachment.pdf",
+                "attachment_id": attachment_id,
+                "inline_data": inline_data,
+            }
+        )
+    for child in part.get("parts") or []:
+        collect_pdf_parts(child, out)
+
+
+def parse_header_map(headers: list[dict[str, str]] | None) -> dict[str, str]:
+    out: dict[str, str] = {}
+    for header in headers or []:
+        name = (header.get("name") or "").lower()
+        if name:
+            out[name] = header.get("value") or ""
+    return out
+
+
+def extract_email_address(value: str) -> str:
+    raw = (value or "").strip().lower()
+    if not raw:
+        return ""
+    m = re.search(r"<([^>]+@[^>]+)>", raw)
+    if m:
+        return m.group(1).strip()
+    m2 = re.search(r"([a-z0-9._%+\-]+@[a-z0-9.\-]+\.[a-z]{2,})", raw)
+    return m2.group(1).strip() if m2 else ""
+
+
+def decode_base64url(value: str) -> bytes:
+    padded = value + ("=" * (-len(value) % 4))
+    return base64.urlsafe_b64decode(padded.encode("ascii"))
+
+
+def extract_sheet_id(sheet_id_or_url: str) -> str:
+    raw = (sheet_id_or_url or "").strip()
+    if not raw:
+        raise HTTPException(400, "Missing Google Sheet id or URL.")
+    m = re.search(r"/spreadsheets/d/([a-zA-Z0-9-_]+)", raw)
+    return m.group(1) if m else raw
+
+
+def extract_sheet_gid(sheet_id_or_url: str) -> int | None:
+    raw = (sheet_id_or_url or "").strip()
+    if not raw:
+        return None
+    m = re.search(r"(?:[?#&]gid=)(\d+)", raw)
+    if not m:
+        return None
+    try:
+        return int(m.group(1))
+    except ValueError:
+        return None
+
+
+def quote_sheet_title(title: str) -> str:
+    t = (title or "").replace("'", "''")
+    return f"'{t}'"
+
+
+def resolve_sheet_title(session: dict[str, Any], sheet_id: str, preferred_name: str, gid: int | None) -> str:
+    meta = gmail_api_request(
+        session,
+        f"https://sheets.googleapis.com/v4/spreadsheets/{sheet_id}?fields=sheets(properties(sheetId,title))",
+    )
+    sheets = (meta or {}).get("sheets") or []
+    titles: list[str] = []
+    gid_map: dict[int, str] = {}
+    for s in sheets:
+        p = s.get("properties") or {}
+        title = (p.get("title") or "").strip()
+        sid = p.get("sheetId")
+        if title:
+            titles.append(title)
+        if isinstance(sid, int) and title:
+            gid_map[sid] = title
+
+    if gid is not None and gid in gid_map:
+        return gid_map[gid]
+
+    preferred = (preferred_name or "").strip()
+    if preferred:
+        for t in titles:
+            if t == preferred:
+                return t
+        for t in titles:
+            if t.lower() == preferred.lower():
+                return t
+
+    if titles:
+        return titles[0]
+
+    raise HTTPException(400, "No worksheet tabs found in this spreadsheet.")
+
+
+def to_sheet_rows(attachments: list[dict[str, Any]]) -> list[list[Any]]:
+    def fmt_mmddyy(value: str) -> str:
+        raw = (value or "").strip()
+        if not raw:
+            return ""
+        m = re.match(r"^(\d{4})-(\d{2})-(\d{2})$", raw)
+        if m:
+            return f"{m.group(2)}/{m.group(3)}/{m.group(1)[2:]}"
+        m2 = re.match(r"^(\d{4})/(\d{2})/(\d{2})$", raw)
+        if m2:
+            return f"{m2.group(2)}/{m2.group(3)}/{m2.group(1)[2:]}"
+        return raw
+
+    def normalize_size(container_type: str) -> str:
+        t = (container_type or "").upper()
+        m = re.search(r"\b(20|40|45)\b", t)
+        if m:
+            return m.group(1)
+        m2 = re.search(r"(20|40|45)", t)
+        if m2:
+            return m2.group(1)
+        return container_type or ""
+
+    rows: list[list[Any]] = []
+    for att in attachments:
+        result = att.get("result") or {}
+        filename = att.get("filename") or ""
+        do = result.get("delivery_order") or {}
+        shipment = do.get("shipment") or {}
+        deliver_to = do.get("deliver_to") or {}
+        pickup = do.get("pick_up_from") or {}
+        containers = do.get("containers") or []
+
+        if not containers:
+            containers = [{}]
+
+        for c in containers:
+            rows.append(
+                [
+                    c.get("container_number", ""),          # A Container
+                    normalize_size(c.get("container_type", "")),  # B Size/Type
+                    shipment.get("mbl_awb", ""),            # C MBL
+                    "PEGASO",                               # D CUSTOMER
+                    "YATES",                                # E WAREHOUSE
+                    fmt_mmddyy(shipment.get("arrival_date", "")),  # F ETA
+                    "",                                     # G LFD (reserved)
+                    pickup.get("company", ""),              # H TERMINAL
+                    "",                                     # I Available (Y/N)
+                    fmt_mmddyy(str(shipment.get("last_free_day") or "")),  # J LFD
+                ]
+            )
+    return rows
+
+
+def empty_delivery_order_payload() -> dict[str, Any]:
+    return {
+        "delivery_order": {
+            "shipment_reference": "",
+            "print_date": "",
+            "issued_by": {"company": "", "address": "", "city": "", "state": "", "zip": "", "country": "", "phone": "", "email": "", "signed_by": ""},
+            "shipment": {
+                "carrier": "",
+                "vessel_name": "",
+                "voyage_flight": "",
+                "port_of_origin": "",
+                "mbl_awb": "",
+                "hbl_ams": "",
+                "it_number": "",
+                "entry_number": "",
+                "arrival_date": "",
+                "last_free_day": None,
+                "delivery_order_issued_to": "",
+                "freight_terms": "",
+            },
+            "deliver_to": {"company": "", "address": "", "city": "", "state": "", "zip": "", "country": "", "email": "", "phone": "", "contact": ""},
+            "pick_up_from": {"company": "", "address": "", "city": "", "state": "", "zip": "", "country": "", "email": "", "phone": "", "contact": ""},
+            "containers": [],
+        }
+    }
+
+
+BAD_FIELD_VALUES = {
+    "ISSUED",
+    "CARRIER SHOWN ABOVE",
+    "SAME AS ABOVE",
+    "SAME AS BILL TO",
+    "N/A",
+    "NA",
+    "NONE",
+    "UNKNOWN",
+}
+
+
+def clean_field(value: str) -> str:
+    v = re.sub(r"\s+", " ", value or "").strip(" \t\r\n:;,-")
+    v = re.split(
+        r"\b(?:VESSEL|VOYAGE|ETA|ARRIVAL|MBL|HBL|DELIVER TO|PICK UP FROM|CONSIGNEE|SHIPPER|PORT OF ORIGIN)\b",
+        v,
+        maxsplit=1,
+        flags=re.IGNORECASE,
+    )[0].strip(" \t\r\n:;,-")
+    return v
+
+
+def is_bad_field_value(value: str) -> bool:
+    v = clean_field(value)
+    if not v or len(v) < 3:
+        return True
+    upper = v.upper()
+    if upper in BAD_FIELD_VALUES:
+        return True
+    if upper.startswith("CARRIER SHOWN"):
+        return True
+    return False
+
+
+def text_lines(text: str) -> list[str]:
+    out: list[str] = []
+    for line in text.splitlines():
+        line2 = re.sub(r"\s+", " ", line).strip()
+        if line2:
+            out.append(line2)
+    return out
+
+
+def find_labeled_value(lines: list[str], labels: list[str], value_pattern: str = r".+") -> str:
+    label_re = "(?:" + "|".join(labels) + ")"
+    for i, line in enumerate(lines):
+        m = re.search(rf"\b{label_re}\b\s*[:#-]?\s*({value_pattern})$", line, re.IGNORECASE)
+        if m:
+            candidate = clean_field(m.group(1))
+            if not is_bad_field_value(candidate):
+                return candidate
+            continue
+
+        # Pattern where label is on one line and value is on next line.
+        if re.fullmatch(rf"{label_re}\s*[:#-]?", line, re.IGNORECASE):
+            if i + 1 < len(lines):
+                candidate = clean_field(lines[i + 1])
+                if not is_bad_field_value(candidate):
+                    return candidate
+    return ""
+
+
+def find_deliver_to_company(lines: list[str]) -> str:
+    for i, line in enumerate(lines):
+        if re.search(r"\b(?:DELIVER\s*TO|CONSIGNEE)\b", line, re.IGNORECASE):
+            tail = re.sub(r"^.*?(?:DELIVER\s*TO|CONSIGNEE)\s*[:#-]?\s*", "", line, flags=re.IGNORECASE).strip()
+            if tail and not is_bad_field_value(tail):
+                return clean_field(tail)
+            for j in range(i + 1, min(i + 5, len(lines))):
+                nxt = clean_field(lines[j])
+                if re.search(
+                    r"^(?:PICK\s*UP\s*FROM|NOTIFY|VESSEL|VOYAGE|ETA|ARRIVAL|MBL|HBL|B/L|CONTAINER|SHIPPER|PORT|TRUCKER)\b",
+                    nxt,
+                    re.IGNORECASE,
+                ):
+                    break
+                if not is_bad_field_value(nxt):
+                    return nxt
+    return ""
+
+
+def parse_weight_kg(text: str) -> float:
+    m = re.search(
+        r"(?:GROSS\s*WEIGHT|WEIGHT|NET\s*WEIGHT)?\s*[:#]?\s*(\d{1,3}(?:,\d{3})*(?:\.\d+)?)\s*(?:KG|KGS|KILOGRAMS?)\b",
+        text,
+        re.IGNORECASE,
+    )
+    if not m:
+        return 0.0
+    try:
+        return float(m.group(1).replace(",", ""))
+    except ValueError:
+        return 0.0
+
+
+def extract_text_from_pdf(pdf_bytes: bytes) -> str:
+    reader = PdfReader(io.BytesIO(pdf_bytes))
+    parts: list[str] = []
+    for page in reader.pages:
+        parts.append(page.extract_text() or "")
+    return "\n".join(parts)
+
+
+def extract_container_numbers(raw_text: str, attachment_name: str = "") -> list[str]:
+    from_text = set(re.findall(r"\b[A-Z]{4}\d{7}\b", raw_text))
+    from_name = set(re.findall(r"\b[A-Z]{4}\d{7}\b", attachment_name.upper()))
+    return sorted(from_text | from_name)
+
+
+def rule_extract_delivery_order(pdf_bytes: bytes, attachment_name: str = "") -> tuple[dict[str, Any], str]:
+    payload = empty_delivery_order_payload()
+    text = extract_text_from_pdf(pdf_bytes)
+    if not text.strip():
+        return payload, text
+
+    do = payload["delivery_order"]
+    lines = text_lines(text)
+    norm = " ".join(lines)
+
+    do["shipment_reference"] = find_labeled_value(
+        lines,
+        ["SHIPMENT\\s*REFERENCE", "S/?REF", "REFERENCE\\s*NO\\.?", "DO\\s*NO\\.?", "DELIVERY\\s*ORDER\\s*NO\\.?"],
+        r"[A-Z0-9][A-Z0-9\-_/]{4,}",
+    )
+    if is_bad_field_value(do["shipment_reference"]):
+        do["shipment_reference"] = ""
+
+    do["shipment"]["vessel_name"] = find_labeled_value(
+        lines,
+        ["VESSEL(?:\\s*NAME)?"],
+        r"[A-Z0-9][A-Z0-9 ./_-]{2,80}",
+    )
+    do["shipment"]["arrival_date"] = find_labeled_value(
+        lines,
+        ["ARRIVAL\\s*DATE", "ETA"],
+        r"[0-9]{1,4}[-/][0-9]{1,2}[-/][0-9]{1,4}",
+    )
+    do["shipment"]["mbl_awb"] = find_labeled_value(
+        lines,
+        ["MBL", "MAWB", "MASTER\\s*B/L", "B/L", "BOL"],
+        r"[A-Z0-9][A-Z0-9\\-_/]{5,}",
+    )
+    do["deliver_to"]["company"] = find_deliver_to_company(lines)
+
+    container_nos = extract_container_numbers(norm, attachment_name=attachment_name)
+    total_weight = parse_weight_kg(norm)
+    if container_nos:
+        each_weight = round(total_weight / len(container_nos), 2) if total_weight > 0 else 0.0
+        for container_no in container_nos:
+            do["containers"].append(
+                {
+                    "container_number": container_no,
+                    "container_type": "",
+                    "seal_number": "",
+                    "hbl_ams": "",
+                    "cartons": 0,
+                    "description": "",
+                    "customer_ref": "",
+                    "weight_lb": 0.0,
+                    "weight_kg": each_weight,
+                    "volume_cbm": 0.0,
+                }
+            )
+    elif total_weight > 0:
+        do["containers"].append(
+            {
+                "container_number": "",
+                "container_type": "",
+                "seal_number": "",
+                "hbl_ams": "",
+                "cartons": 0,
+                "description": "",
+                "customer_ref": "",
+                "weight_lb": 0.0,
+                "weight_kg": total_weight,
+                "volume_cbm": 0.0,
+            }
+        )
+
+    return payload, text
+
+
 @app.middleware("http")
 async def auth_middleware(request: Request, call_next):
     path = request.url.path
     if not path.startswith("/api"):
         return await call_next(request)
-    if path == "/api/auth/login":
+    if path in {"/api/auth/login", "/api/auth/register"}:
         return await call_next(request)
 
     auth_header = request.headers.get("authorization", "")
     token = auth_header.removeprefix("Bearer ").strip() if auth_header.startswith("Bearer ") else ""
+    if not token and (
+        request.url.path.startswith("/api/documents/")
+        or request.url.path.startswith("/api/downloads/")
+    ):
+        token = request.query_params.get("token", "").strip()
     if not token:
         return JSONResponse(status_code=401, content={"detail": "Unauthorized"})
 
@@ -202,6 +739,51 @@ def login(payload: LoginRequest) -> dict[str, Any]:
         }
 
 
+@app.post("/api/auth/register")
+def register(payload: RegisterRequest) -> dict[str, Any]:
+    email = payload.email.strip().lower()
+    raw_password = payload.password.strip()
+    if not email or "@" not in email:
+        raise HTTPException(400, "Invalid email")
+    if len(raw_password) < 8:
+        raise HTTPException(400, "Password must be at least 8 characters")
+
+    with get_conn() as conn:
+        exists = conn.execute("SELECT id FROM auth_users WHERE email = ?", (email,)).fetchone()
+        if exists:
+            raise HTTPException(409, "Email already registered")
+
+        now = datetime.utcnow()
+        conn.execute(
+            """
+            INSERT INTO auth_users(email, password_hash, role, timezone, created_at)
+            VALUES (?, ?, 'customer', 'America/Los_Angeles', ?)
+            """,
+            (email, password_hash(raw_password), now.isoformat(timespec="seconds")),
+        )
+        user = conn.execute(
+            "SELECT id, email, role, timezone FROM auth_users WHERE email = ?",
+            (email,),
+        ).fetchone()
+
+        token = secrets.token_urlsafe(32)
+        expires_at = (now + timedelta(hours=12)).isoformat(timespec="seconds")
+        conn.execute(
+            "INSERT INTO auth_sessions(user_id, token, created_at, expires_at) VALUES (?, ?, ?, ?)",
+            (user["id"], token, now.isoformat(timespec="seconds"), expires_at),
+        )
+        conn.commit()
+
+    return {
+        "token": token,
+        "user": {
+            "email": user["email"],
+            "role": user["role"],
+            "timezone": user["timezone"],
+        },
+    }
+
+
 @app.get("/api/auth/me")
 def me(request: Request) -> dict[str, Any]:
     user = require_user(request)
@@ -222,21 +804,82 @@ def logout(request: Request) -> dict[str, Any]:
     return {"ok": True}
 
 
-@app.get("/api/overview/stats")
-def overview_stats() -> dict[str, Any]:
+@app.get("/api/admin/users")
+def admin_list_users(request: Request) -> dict[str, Any]:
+    require_role(request, {"admin"})
     with get_conn() as conn:
-        total = conn.execute("SELECT COUNT(*) c FROM shipments").fetchone()["c"]
+        rows = conn.execute(
+            """
+            SELECT id, email, role, timezone, created_at
+            FROM auth_users
+            ORDER BY created_at DESC
+            """
+        ).fetchall()
+        return {"items": [dict(r) for r in rows]}
+
+
+@app.post("/api/admin/users/{user_id}/role")
+def admin_update_user_role(user_id: int, payload: UserRoleUpdate, request: Request) -> dict[str, Any]:
+    current = require_role(request, {"admin"})
+    new_role = payload.role.strip().lower()
+    if new_role not in {"customer", "operator", "admin"}:
+        raise HTTPException(400, "Invalid role")
+
+    with get_conn() as conn:
+        row = conn.execute("SELECT id, role FROM auth_users WHERE id = ?", (user_id,)).fetchone()
+        if not row:
+            raise HTTPException(404, "User not found")
+        if row["id"] == current["id"] and new_role != "admin":
+            raise HTTPException(400, "Admin cannot remove own admin role")
+
+        conn.execute("UPDATE auth_users SET role = ? WHERE id = ?", (new_role, user_id))
+        conn.commit()
+    return {"ok": True}
+
+
+@app.delete("/api/admin/users/{user_id}")
+def admin_delete_user(user_id: int, request: Request) -> dict[str, Any]:
+    current = require_role(request, {"admin"})
+    if user_id == current["id"]:
+        raise HTTPException(400, "Cannot delete current admin account")
+
+    with get_conn() as conn:
+        row = conn.execute("SELECT id, role FROM auth_users WHERE id = ?", (user_id,)).fetchone()
+        if not row:
+            raise HTTPException(404, "User not found")
+        if row["role"] == "admin":
+            admin_count = conn.execute("SELECT COUNT(*) c FROM auth_users WHERE role = 'admin'").fetchone()["c"]
+            if admin_count <= 1:
+                raise HTTPException(400, "At least one admin account must remain")
+
+        conn.execute("DELETE FROM auth_sessions WHERE user_id = ?", (user_id,))
+        conn.execute("DELETE FROM auth_users WHERE id = ?", (user_id,))
+        conn.commit()
+    return {"ok": True}
+
+
+@app.get("/api/overview/stats")
+def overview_stats(request: Request) -> dict[str, Any]:
+    user = require_user(request)
+    scope_sql, scope_args = shipment_scope(user)
+    with get_conn() as conn:
+        total = conn.execute(f"SELECT COUNT(*) c FROM shipments WHERE {scope_sql}", scope_args).fetchone()["c"]
         stats = {"total": total}
         for s in STATUS_ORDER:
-            stats[s] = conn.execute("SELECT COUNT(*) c FROM shipments WHERE status = ?", (s,)).fetchone()["c"]
+            stats[s] = conn.execute(
+                f"SELECT COUNT(*) c FROM shipments WHERE {scope_sql} AND status = ?",
+                [*scope_args, s],
+            ).fetchone()["c"]
         return stats
 
 
 @app.get("/api/overview/shipments")
-def overview_shipments(search: str = "", status: str = "all", page: int = 1, page_size: int = 20) -> dict[str, Any]:
+def overview_shipments(request: Request, search: str = "", status: str = "all", page: int = 1, page_size: int = 20) -> dict[str, Any]:
+    user = require_user(request)
     with get_conn() as conn:
-        where = ["1=1"]
-        args: list[Any] = []
+        scope_sql, scope_args = shipment_scope(user)
+        where = [scope_sql]
+        args: list[Any] = [*scope_args]
         if search:
             where.append("(shipment_id LIKE ? OR container_no LIKE ? OR mbol LIKE ? OR terminal LIKE ?)")
             like = f"%{search}%"
@@ -279,6 +922,7 @@ def overview_shipments(search: str = "", status: str = "all", page: int = 1, pag
 
 @app.get("/api/shipments")
 def list_shipments(
+    request: Request,
     search: str = "",
     status: str = "all",
     today_pickup: bool = False,
@@ -288,6 +932,7 @@ def list_shipments(
     page: int = 1,
     page_size: int = 20,
 ) -> dict[str, Any]:
+    user = require_user(request)
     sort_map = {
         "status_priority": "CASE status " + " ".join([f"WHEN '{s}' THEN {i}" for i, s in enumerate(STATUS_ORDER)]) + " END ASC",
         "lfd_asc": "lfd_at ASC",
@@ -300,8 +945,9 @@ def list_shipments(
     }
     order_by = sort_map.get(sort, "created_at DESC")
 
-    where = ["1=1"]
-    args: list[Any] = []
+    scope_sql, scope_args = shipment_scope(user)
+    where = [scope_sql]
+    args: list[Any] = [*scope_args]
 
     if search:
         like = f"%{search}%"
@@ -344,7 +990,8 @@ def list_shipments(
 
 
 @app.post("/api/shipments")
-def create_shipment(payload: ShipmentCreate) -> dict[str, Any]:
+def create_shipment(payload: ShipmentCreate, request: Request) -> dict[str, Any]:
+    user = require_user(request)
     if payload.status not in STATUS_ORDER:
         raise HTTPException(400, "Invalid status")
 
@@ -352,20 +999,22 @@ def create_shipment(payload: ShipmentCreate) -> dict[str, Any]:
         s = v.strip()
         return s if s else None
 
+    owner_user_id = user["id"] if user["role"] == "customer" else None
     now = datetime.utcnow().isoformat(timespec="seconds")
     with get_conn() as conn:
         try:
             conn.execute(
                 """
                 INSERT INTO shipments(
-                  shipment_id, container_no, mbol, size, terminal, carrier, eta_at, lfd_at, dg,
+                  shipment_id, owner_user_id, container_no, mbol, size, terminal, carrier, eta_at, lfd_at, dg,
                   deliver_company, deliver_to, warehouse_contact, warehouse_phone, remark,
                   pickup_appt_at, scheduled_delivery_at, actual_delivery_at, empty_date_at, empty_return_at,
                   waiting_port_minutes, waiting_local_minutes, status, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, 0, 0, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, 0, 0, ?, ?, ?)
                 """,
                 (
                     payload.shipment_id.strip(),
+                    owner_user_id,
                     payload.container_no.strip(),
                     val(payload.mbol),
                     payload.size.strip() or "40HC",
@@ -395,10 +1044,13 @@ def create_shipment(payload: ShipmentCreate) -> dict[str, Any]:
 
 
 @app.get("/api/shipments/{shipment_id}")
-def shipment_detail(shipment_id: str) -> dict[str, Any]:
+def shipment_detail(shipment_id: str, request: Request) -> dict[str, Any]:
+    user = require_user(request)
     with get_conn() as conn:
         row = conn.execute("SELECT * FROM shipments WHERE shipment_id = ?", (shipment_id,)).fetchone()
         if not row:
+            raise HTTPException(404, "Shipment not found")
+        if user["role"] == "customer" and row["owner_user_id"] != user["id"]:
             raise HTTPException(404, "Shipment not found")
         shipment = row_to_shipment(row)
         shipment["documents"] = {
@@ -497,10 +1149,13 @@ def update_shipment_times(shipment_id: str, payload: ShipmentTimeUpdate, request
 
 
 @app.delete("/api/shipments/{shipment_id}")
-def delete_shipment(shipment_id: str) -> dict[str, Any]:
+def delete_shipment(shipment_id: str, request: Request) -> dict[str, Any]:
+    user = require_user(request)
     with get_conn() as conn:
-        row = conn.execute("SELECT id FROM shipments WHERE shipment_id = ?", (shipment_id,)).fetchone()
+        row = conn.execute("SELECT id, owner_user_id FROM shipments WHERE shipment_id = ?", (shipment_id,)).fetchone()
         if not row:
+            raise HTTPException(404, "Shipment not found")
+        if user["role"] == "customer" and row["owner_user_id"] != user["id"]:
             raise HTTPException(404, "Shipment not found")
         shipment_pk = row["id"]
 
@@ -524,8 +1179,10 @@ async def upload_document(shipment_id: str, doc_type: str, request: Request, fil
         raise HTTPException(403, "Only operator can upload POD")
 
     with get_conn() as conn:
-        row = conn.execute("SELECT id FROM shipments WHERE shipment_id = ?", (shipment_id,)).fetchone()
+        row = conn.execute("SELECT id, owner_user_id FROM shipments WHERE shipment_id = ?", (shipment_id,)).fetchone()
         if not row:
+            raise HTTPException(404, "Shipment not found")
+        if user["role"] == "customer" and row["owner_user_id"] != user["id"]:
             raise HTTPException(404, "Shipment not found")
         shipment_pk = row["id"]
 
@@ -553,10 +1210,21 @@ async def upload_document(shipment_id: str, doc_type: str, request: Request, fil
 
 
 @app.get("/api/documents/{doc_id}/download")
-def download_document(doc_id: int) -> FileResponse:
+def download_document(doc_id: int, request: Request) -> FileResponse:
+    user = require_user(request)
     with get_conn() as conn:
-        doc = conn.execute("SELECT * FROM shipment_documents WHERE id = ?", (doc_id,)).fetchone()
+        doc = conn.execute(
+            """
+            SELECT d.*, s.owner_user_id
+            FROM shipment_documents d
+            JOIN shipments s ON s.id = d.shipment_id
+            WHERE d.id = ?
+            """,
+            (doc_id,),
+        ).fetchone()
         if not doc:
+            raise HTTPException(404, "Document not found")
+        if user["role"] == "customer" and doc["owner_user_id"] != user["id"]:
             raise HTTPException(404, "Document not found")
         file_path = Path(doc["file_path"])
         if not file_path.exists():
@@ -569,10 +1237,12 @@ def download_document(doc_id: int) -> FileResponse:
 
 
 @app.get("/api/empty-returns")
-def empty_returns(search: str = "", page: int = 1, page_size: int = 20) -> dict[str, Any]:
+def empty_returns(request: Request, search: str = "", page: int = 1, page_size: int = 20) -> dict[str, Any]:
+    user = require_user(request)
     statuses = ("delivered", "empty_date_confirmed", "empty_returned")
-    where = ["status IN (?, ?, ?)"]
-    args: list[Any] = list(statuses)
+    scope_sql, scope_args = shipment_scope(user)
+    where = [scope_sql, "status IN (?, ?, ?)"]
+    args: list[Any] = [*scope_args, *list(statuses)]
     if search:
         like = f"%{search}%"
         where.append("(shipment_id LIKE ? OR container_no LIKE ? OR mbol LIKE ? OR terminal LIKE ?)")
@@ -614,14 +1284,25 @@ def empty_returns(search: str = "", page: int = 1, page_size: int = 20) -> dict[
 
 
 @app.get("/api/do-download/list")
-def do_download_list(search: str = "") -> dict[str, Any]:
+def do_download_list(request: Request, search: str = "", today_pickup: bool = False, next_day_pickup: bool = False) -> dict[str, Any]:
+    user = require_user(request)
     with get_conn() as conn:
         where = ["1=1"]
         args: list[Any] = []
+        if user["role"] == "customer":
+            where.append("s.owner_user_id = ?")
+            args.append(user["id"])
         if search:
             like = f"%{search}%"
             where.append("(s.shipment_id LIKE ? OR s.container_no LIKE ? OR s.deliver_to LIKE ? OR d.file_name LIKE ?)")
             args.extend([like, like, like, like])
+        now = datetime.now()
+        if today_pickup:
+            where.append("date(s.pickup_appt_at) = date(?)")
+            args.append(now.isoformat(sep=" "))
+        if next_day_pickup:
+            where.append("date(s.pickup_appt_at) = date(?, '+1 day')")
+            args.append(now.isoformat(sep=" "))
         rows = conn.execute(
             f"""
             SELECT s.shipment_id, s.container_no, s.deliver_to,
@@ -637,20 +1318,26 @@ def do_download_list(search: str = "") -> dict[str, Any]:
 
 
 @app.post("/api/do-download/batch")
-def do_batch_download(shipment_ids: list[str]) -> dict[str, Any]:
+def do_batch_download(shipment_ids: list[str], request: Request) -> dict[str, Any]:
+    user = require_user(request)
     if not shipment_ids:
         raise HTTPException(400, "No shipments selected")
 
     with get_conn() as conn:
         placeholders = ",".join("?" for _ in shipment_ids)
+        where_scope = ""
+        args: list[Any] = list(shipment_ids)
+        if user["role"] == "customer":
+            where_scope = " AND s.owner_user_id = ?"
+            args.append(user["id"])
         rows = conn.execute(
             f"""
             SELECT d.id as doc_id, d.file_path, d.file_name, s.shipment_id
             FROM shipment_documents d
             JOIN shipments s ON s.id = d.shipment_id
-            WHERE s.shipment_id IN ({placeholders}) AND d.doc_type = 'DO' AND d.is_latest = 1
+            WHERE s.shipment_id IN ({placeholders}) AND d.doc_type = 'DO' AND d.is_latest = 1 {where_scope}
             """,
-            shipment_ids,
+            args,
         ).fetchall()
 
         if not rows:
@@ -678,9 +1365,13 @@ def download_batch_zip(file_name: str) -> FileResponse:
 
 
 @app.get("/api/pod-upload/list")
-def pod_upload_list(search: str = "") -> dict[str, Any]:
+def pod_upload_list(request: Request, search: str = "") -> dict[str, Any]:
+    user = require_user(request)
     where = ["s.status = 'dispatched'"]
     args: list[Any] = []
+    if user["role"] == "customer":
+        where.append("s.owner_user_id = ?")
+        args.append(user["id"])
     if search:
         like = f"%{search}%"
         where.append("(s.shipment_id LIKE ? OR s.container_no LIKE ? OR s.terminal LIKE ? OR s.deliver_to LIKE ? OR s.status LIKE ?)")
@@ -702,27 +1393,34 @@ def pod_upload_list(search: str = "") -> dict[str, Any]:
 
 
 @app.get("/api/tickets")
-def list_tickets() -> dict[str, Any]:
+def list_tickets(request: Request) -> dict[str, Any]:
+    user = require_user(request)
     with get_conn() as conn:
-        rows = conn.execute(
-            """
+        sql = """
             SELECT t.ticket_no, s.shipment_id, t.category, t.attachment_name, t.status, t.created_at
             FROM tickets t
             LEFT JOIN shipments s ON s.id = t.shipment_id
-            ORDER BY t.created_at DESC
             """
-        ).fetchall()
+        args: list[Any] = []
+        if user["role"] == "customer":
+            sql += " WHERE s.owner_user_id = ?"
+            args.append(user["id"])
+        sql += " ORDER BY t.created_at DESC"
+        rows = conn.execute(sql, args).fetchall()
         return {"items": [dict(r) for r in rows]}
 
 
 @app.post("/api/tickets")
-def create_ticket(payload: TicketCreate) -> dict[str, Any]:
+def create_ticket(payload: TicketCreate, request: Request) -> dict[str, Any]:
+    user = require_user(request)
     with get_conn() as conn:
         ticket_no = f"T{int(datetime.utcnow().timestamp())}"
         shipment_pk = None
         if payload.shipment_id:
-            row = conn.execute("SELECT id FROM shipments WHERE shipment_id = ?", (payload.shipment_id,)).fetchone()
+            row = conn.execute("SELECT id, owner_user_id FROM shipments WHERE shipment_id = ?", (payload.shipment_id,)).fetchone()
             if row:
+                if user["role"] == "customer" and row["owner_user_id"] != user["id"]:
+                    raise HTTPException(404, "Shipment not found")
                 shipment_pk = row["id"]
         conn.execute(
             """
@@ -753,6 +1451,352 @@ def pricing_rules() -> dict[str, Any]:
 def pricing_refresh(request: Request) -> dict[str, Any]:
     require_role(request, {"operator"})
     return {"ok": True, "refreshed_at": datetime.utcnow().isoformat(timespec="seconds")}
+
+
+@app.get("/gmail-do")
+def gmail_do_page() -> FileResponse:
+    page_path = FRONTEND_DIR / "gmail_do.html"
+    if not page_path.exists():
+        raise HTTPException(404, "gmail_do.html not found")
+    return FileResponse(page_path)
+
+
+@app.get("/gmail/session")
+def gmail_session(request: Request) -> JSONResponse:
+    sid, session, created = get_or_create_gmail_session(request)
+    profile = session.get("gmail_profile", {})
+    resp = JSONResponse(
+        {
+            "authenticated": bool(session.get("access_token")),
+            "email": profile.get("emailAddress"),
+        }
+    )
+    if created:
+        set_gmail_cookie(resp, sid)
+    return resp
+
+
+@app.get("/gmail/auth/start")
+def gmail_auth_start(request: Request) -> JSONResponse:
+    sid, session, created = get_or_create_gmail_session(request)
+    client_id = gmail_env("GOOGLE_CLIENT_ID", required=True)
+    redirect_uri = gmail_env("GOOGLE_OAUTH_REDIRECT_URI", str(request.base_url) + "gmail/auth/callback")
+
+    state = secrets.token_urlsafe(24)
+    session["oauth_state"] = state
+    session["oauth_redirect_uri"] = redirect_uri
+
+    params = {
+        "client_id": client_id,
+        "redirect_uri": redirect_uri,
+        "response_type": "code",
+        "scope": "openid email https://www.googleapis.com/auth/gmail.readonly https://www.googleapis.com/auth/spreadsheets",
+        "access_type": "offline",
+        "include_granted_scopes": "true",
+        "prompt": "consent",
+        "state": state,
+    }
+    auth_url = "https://accounts.google.com/o/oauth2/v2/auth?" + urllib.parse.urlencode(params)
+    resp = JSONResponse({"auth_url": auth_url})
+    if created:
+        set_gmail_cookie(resp, sid)
+    return resp
+
+
+@app.get("/gmail/auth/callback")
+def gmail_auth_callback(request: Request, code: str = "", state: str = "", error: str = "") -> RedirectResponse:
+    sid = request.cookies.get(GMAIL_COOKIE_NAME, "")
+    session = GMAIL_OAUTH_SESSIONS.get(sid)
+    if not session:
+        raise HTTPException(400, "OAuth session missing. Please retry sign-in.")
+    if error:
+        raise HTTPException(400, f"Google OAuth error: {error}")
+    if not code:
+        raise HTTPException(400, "Missing Google OAuth code.")
+    if state != session.get("oauth_state"):
+        raise HTTPException(400, "OAuth state mismatch.")
+
+    redirect_uri = session.get("oauth_redirect_uri") or gmail_env("GOOGLE_OAUTH_REDIRECT_URI", str(request.base_url) + "gmail/auth/callback")
+    token_data = google_token_request(
+        {
+            "client_id": gmail_env("GOOGLE_CLIENT_ID", required=True),
+            "client_secret": gmail_env("GOOGLE_CLIENT_SECRET", required=True),
+            "code": code,
+            "redirect_uri": redirect_uri,
+            "grant_type": "authorization_code",
+        }
+    )
+
+    access_token = token_data.get("access_token", "")
+    if not access_token:
+        raise HTTPException(400, "Google token response missing access_token.")
+
+    session["access_token"] = access_token
+    refresh_token = token_data.get("refresh_token")
+    if refresh_token:
+        session["refresh_token"] = refresh_token
+    session["expires_at_ts"] = datetime.utcnow().timestamp() + int(token_data.get("expires_in", 3600)) - 30
+    session["created_at_ts"] = datetime.utcnow().timestamp()
+    session["gmail_profile"] = get_gmail_profile(session)
+    session.pop("oauth_state", None)
+    session.pop("oauth_redirect_uri", None)
+
+    resp = RedirectResponse(url="/gmail-do?connected=1", status_code=302)
+    set_gmail_cookie(resp, sid)
+    return resp
+
+
+@app.post("/gmail/logout")
+def gmail_logout(request: Request) -> JSONResponse:
+    sid = request.cookies.get(GMAIL_COOKIE_NAME, "")
+    if sid:
+        GMAIL_OAUTH_SESSIONS.pop(sid, None)
+    resp = JSONResponse({"ok": True})
+    resp.delete_cookie(GMAIL_COOKIE_NAME)
+    return resp
+
+
+@app.get("/gmail/messages")
+def gmail_messages(
+    request: Request,
+    q: str = "in:anywhere has:attachment (subject:(DO OR \"delivery order\" OR 提柜预报) OR filename:(DO OR Delivery_Order)) newer_than:90d",
+    max_results: int = 15,
+    incoming_only: bool = True,
+) -> JSONResponse:
+    sid = request.cookies.get(GMAIL_COOKIE_NAME, "")
+    session = GMAIL_OAUTH_SESSIONS.get(sid)
+    if not session or not session.get("access_token"):
+        raise HTTPException(401, "Not connected to Gmail.")
+
+    profile = session.get("gmail_profile") or get_gmail_profile(session)
+    me_email = extract_email_address((profile or {}).get("emailAddress", ""))
+
+    max_results = max(1, min(max_results, 200))
+    query = urllib.parse.urlencode({"q": q, "maxResults": str(max_results)})
+    list_url = f"https://gmail.googleapis.com/gmail/v1/users/me/messages?{query}"
+    listed = gmail_api_request(session, list_url)
+    items: list[dict[str, Any]] = []
+    for msg in listed.get("messages") or []:
+        msg_id = msg.get("id")
+        if not msg_id:
+            continue
+        detail_url = f"https://gmail.googleapis.com/gmail/v1/users/me/messages/{msg_id}?format=full"
+        detail = gmail_api_request(session, detail_url)
+        payload = detail.get("payload") or {}
+        headers = parse_header_map(payload.get("headers"))
+        from_addr = headers.get("from", "")
+        from_email = extract_email_address(from_addr)
+        is_outgoing = bool(me_email and from_email and from_email == me_email)
+        if incoming_only and is_outgoing:
+            continue
+        pdf_parts: list[dict[str, Any]] = []
+        collect_pdf_parts(payload, pdf_parts)
+
+        items.append(
+            {
+                "id": msg_id,
+                "thread_id": detail.get("threadId"),
+                "from": from_addr,
+                "subject": headers.get("subject", "(no subject)"),
+                "date": headers.get("date", ""),
+                "snippet": detail.get("snippet", ""),
+                "pdf_count": len(pdf_parts),
+                "pdf_files": [p["filename"] for p in pdf_parts],
+                "is_outgoing": is_outgoing,
+            }
+        )
+    return JSONResponse({"items": items})
+
+
+@app.post("/gmail/process")
+def gmail_process(payload: GmailProcessRequest, request: Request) -> dict[str, Any]:
+    sid = request.cookies.get(GMAIL_COOKIE_NAME, "")
+    session = GMAIL_OAUTH_SESSIONS.get(sid)
+    if not session or not session.get("access_token"):
+        raise HTTPException(401, "Not connected to Gmail.")
+
+    anthropic_key = gmail_env("ANTHROPIC_API_KEY", required=True)
+    anthropic_model = gmail_env("ANTHROPIC_MODEL", "claude-haiku-4-5-20251001")
+    anthropic_max_tokens = int(gmail_env("ANTHROPIC_MAX_TOKENS", "2048"))
+
+    detail_url = f"https://gmail.googleapis.com/gmail/v1/users/me/messages/{payload.message_id}?format=full"
+    detail = gmail_api_request(session, detail_url)
+    message_payload = detail.get("payload") or {}
+    headers = parse_header_map(message_payload.get("headers"))
+
+    pdf_parts: list[dict[str, Any]] = []
+    collect_pdf_parts(message_payload, pdf_parts)
+    if not pdf_parts:
+        raise HTTPException(400, "No PDF attachments found in this message.")
+
+    extracted_items: list[dict[str, Any]] = []
+    for part in pdf_parts:
+        filename = part["filename"]
+        attachment_id = part.get("attachment_id")
+        inline_data = part.get("inline_data")
+        pdf_bytes: bytes | None = None
+
+        if inline_data:
+            pdf_bytes = decode_base64url(inline_data)
+        elif attachment_id:
+            attachment_url = f"https://gmail.googleapis.com/gmail/v1/users/me/messages/{payload.message_id}/attachments/{attachment_id}"
+            attachment = gmail_api_request(session, attachment_url)
+            data = attachment.get("data")
+            if data:
+                pdf_bytes = decode_base64url(data)
+
+        if not pdf_bytes:
+            extracted_items.append({"filename": filename, "error": "Unable to read attachment content."})
+            continue
+
+        try:
+            extracted = anthropic_extract(
+                pdf_bytes=pdf_bytes,
+                api_key=anthropic_key,
+                model=anthropic_model,
+                max_tokens=anthropic_max_tokens,
+            )
+            do_data = (extracted or {}).get("delivery_order", {})
+            total_kg = 0.0
+            for container in do_data.get("containers") or []:
+                try:
+                    total_kg += float(container.get("weight_kg") or 0)
+                except (TypeError, ValueError):
+                    continue
+            extracted_items.append(
+                {
+                    "filename": filename,
+                    "shipment_reference": do_data.get("shipment_reference"),
+                    "container_count": len(do_data.get("containers") or []),
+                    "total_weight_kg": round(total_kg, 2),
+                    "result": extracted,
+                }
+            )
+        except Exception as exc:
+            extracted_items.append({"filename": filename, "error": str(exc)})
+
+    return {
+        "message": {
+            "id": payload.message_id,
+            "subject": headers.get("subject", "(no subject)"),
+            "from": headers.get("from", ""),
+            "date": headers.get("date", ""),
+        },
+        "attachments": extracted_items,
+    }
+
+
+@app.post("/gmail/process-free")
+def gmail_process_free(payload: GmailProcessRequest, request: Request) -> dict[str, Any]:
+    sid = request.cookies.get(GMAIL_COOKIE_NAME, "")
+    session = GMAIL_OAUTH_SESSIONS.get(sid)
+    if not session or not session.get("access_token"):
+        raise HTTPException(401, "Not connected to Gmail.")
+
+    detail_url = f"https://gmail.googleapis.com/gmail/v1/users/me/messages/{payload.message_id}?format=full"
+    detail = gmail_api_request(session, detail_url)
+    message_payload = detail.get("payload") or {}
+    headers = parse_header_map(message_payload.get("headers"))
+
+    pdf_parts: list[dict[str, Any]] = []
+    collect_pdf_parts(message_payload, pdf_parts)
+    if not pdf_parts:
+        raise HTTPException(400, "No PDF attachments found in this message.")
+
+    extracted_items: list[dict[str, Any]] = []
+    for part in pdf_parts:
+        filename = part["filename"]
+        attachment_id = part.get("attachment_id")
+        inline_data = part.get("inline_data")
+        pdf_bytes: bytes | None = None
+
+        if inline_data:
+            pdf_bytes = decode_base64url(inline_data)
+        elif attachment_id:
+            attachment_url = f"https://gmail.googleapis.com/gmail/v1/users/me/messages/{payload.message_id}/attachments/{attachment_id}"
+            attachment = gmail_api_request(session, attachment_url)
+            data = attachment.get("data")
+            if data:
+                pdf_bytes = decode_base64url(data)
+
+        if not pdf_bytes:
+            extracted_items.append({"filename": filename, "error": "Unable to read attachment content."})
+            continue
+
+        try:
+            extracted, raw_text = rule_extract_delivery_order(pdf_bytes, attachment_name=filename)
+            do_data = (extracted or {}).get("delivery_order", {})
+            total_kg = 0.0
+            for container in do_data.get("containers") or []:
+                try:
+                    total_kg += float(container.get("weight_kg") or 0)
+                except (TypeError, ValueError):
+                    continue
+            extracted_items.append(
+                {
+                    "filename": filename,
+                    "shipment_reference": do_data.get("shipment_reference"),
+                    "container_count": len(do_data.get("containers") or []),
+                    "total_weight_kg": round(total_kg, 2),
+                    "debug_text": (raw_text or "")[:12000],
+                    "result": extracted,
+                }
+            )
+        except Exception as exc:
+            extracted_items.append({"filename": filename, "error": str(exc)})
+
+    return {
+        "message": {
+            "id": payload.message_id,
+            "subject": headers.get("subject", "(no subject)"),
+            "from": headers.get("from", ""),
+            "date": headers.get("date", ""),
+        },
+        "attachments": extracted_items,
+    }
+
+
+@app.post("/sheets/append")
+def sheets_append(payload: SheetAppendRequest, request: Request) -> dict[str, Any]:
+    try:
+        sid = request.cookies.get(GMAIL_COOKIE_NAME, "")
+        session = GMAIL_OAUTH_SESSIONS.get(sid)
+        if not session or not session.get("access_token"):
+            raise HTTPException(401, "Not connected to Google.")
+
+        sheet_id = extract_sheet_id(payload.sheet_id_or_url)
+        sheet_gid = extract_sheet_gid(payload.sheet_id_or_url)
+        sheet_title = resolve_sheet_title(session, sheet_id, payload.sheet_name, sheet_gid)
+        rows = to_sheet_rows(payload.attachments)
+        if not rows:
+            raise HTTPException(400, "No extracted attachment results to append.")
+
+        target_range = f"{quote_sheet_title(sheet_title)}!A:J"
+        encoded_range = urllib.parse.quote(target_range, safe="!:")
+        url = (
+            f"https://sheets.googleapis.com/v4/spreadsheets/{sheet_id}/values/{encoded_range}:append"
+            "?valueInputOption=USER_ENTERED&insertDataOption=INSERT_ROWS"
+        )
+        resp = gmail_api_request(session, url, method="POST", body={"values": rows})
+    except HTTPException as exc:
+        msg = str(exc.detail)
+        if "insufficientPermissions" in msg or "ACCESS_TOKEN_SCOPE_INSUFFICIENT" in msg:
+            raise HTTPException(
+                403,
+                "Google Sheets permission missing. Please click Disconnect, then Sign in with Google again to grant Sheets access.",
+            ) from exc
+        raise
+    except Exception as exc:
+        raise HTTPException(400, f"Sheets append failed: {exc}") from exc
+
+    updates = (resp or {}).get("updates") or {}
+    return {
+        "ok": True,
+        "sheet_id": sheet_id,
+        "sheet_name": sheet_title,
+        "rows_appended": updates.get("updatedRows", len(rows)),
+        "range": updates.get("updatedRange", target_range),
+    }
 
 
 app.mount("/", StaticFiles(directory=FRONTEND_DIR, html=True), name="frontend")

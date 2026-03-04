@@ -4,3 +4,6 @@ __pycache__/
 data/
 uploads/
 downloads/
+.env
+.env.*
+!.env.email.example
