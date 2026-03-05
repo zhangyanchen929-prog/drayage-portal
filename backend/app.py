@@ -573,6 +573,25 @@ def resolve_sheet_title(
     raise HTTPException(400, "No worksheet tabs found in this spreadsheet.")
 
 
+def get_next_sheet_row_index(
+    sheet_id: str,
+    sheet_title: str,
+    session: dict[str, Any] | None = None,
+    bearer_token: str = "",
+) -> int:
+    col_a_range = f"{quote_sheet_title(sheet_title)}!A:A"
+    encoded_range = urllib.parse.quote(col_a_range, safe="!:")
+    url = f"https://sheets.googleapis.com/v4/spreadsheets/{sheet_id}/values/{encoded_range}"
+    if bearer_token:
+        data = google_api_request_with_bearer(bearer_token, url)
+    elif session is not None:
+        data = gmail_api_request(session, url)
+    else:
+        raise HTTPException(500, "get_next_sheet_row_index requires session or bearer_token.")
+    values = (data or {}).get("values") or []
+    return len(values) + 1
+
+
 def to_sheet_rows(attachments: list[dict[str, Any]]) -> list[list[Any]]:
     def fmt_mmddyy(value: str) -> str:
         raw = (value or "").strip()
@@ -2126,6 +2145,11 @@ def sheets_append(payload: SheetAppendRequest, request: Request) -> dict[str, An
                 gid=sheet_gid,
                 session=session,
             )
+            next_row = get_next_sheet_row_index(
+                sheet_id=sheet_id,
+                sheet_title=sheet_title,
+                session=session,
+            )
         else:
             sa_token = get_service_account_sheets_token()
             sheet_title = resolve_sheet_title(
@@ -2134,17 +2158,20 @@ def sheets_append(payload: SheetAppendRequest, request: Request) -> dict[str, An
                 gid=sheet_gid,
                 bearer_token=sa_token,
             )
+            next_row = get_next_sheet_row_index(
+                sheet_id=sheet_id,
+                sheet_title=sheet_title,
+                bearer_token=sa_token,
+            )
 
-        target_range = f"{quote_sheet_title(sheet_title)}!A:J"
+        end_row = next_row + len(rows) - 1
+        target_range = f"{quote_sheet_title(sheet_title)}!A{next_row}:J{end_row}"
         encoded_range = urllib.parse.quote(target_range, safe="!:")
-        url = (
-            f"https://sheets.googleapis.com/v4/spreadsheets/{sheet_id}/values/{encoded_range}:append"
-            "?valueInputOption=USER_ENTERED&insertDataOption=INSERT_ROWS"
-        )
+        url = f"https://sheets.googleapis.com/v4/spreadsheets/{sheet_id}/values/{encoded_range}?valueInputOption=USER_ENTERED"
         if has_oauth:
-            resp = gmail_api_request(session, url, method="POST", body={"values": rows})
+            resp = gmail_api_request(session, url, method="PUT", body={"values": rows})
         else:
-            resp = google_api_request_with_bearer(sa_token, url, method="POST", body={"values": rows})
+            resp = google_api_request_with_bearer(sa_token, url, method="PUT", body={"values": rows})
     except HTTPException as exc:
         msg = str(exc.detail)
         if "insufficientPermissions" in msg or "ACCESS_TOKEN_SCOPE_INSUFFICIENT" in msg:
@@ -2164,7 +2191,7 @@ def sheets_append(payload: SheetAppendRequest, request: Request) -> dict[str, An
     except Exception as exc:
         raise HTTPException(400, f"Sheets append failed: {exc}") from exc
 
-    updates = (resp or {}).get("updates") or {}
+    updates = (resp or {})
     return {
         "ok": True,
         "sheet_id": sheet_id,
