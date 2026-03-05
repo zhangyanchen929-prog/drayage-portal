@@ -38,6 +38,11 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 FRONTEND_DIR = BASE_DIR / "frontend"
 DOWNLOADS_DIR = BASE_DIR / "downloads"
 DOWNLOADS_DIR.mkdir(parents=True, exist_ok=True)
+DATA_DIR = BASE_DIR / "data"
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+SHARED_GOOGLE_TOKEN_FILE = Path(
+    os.getenv("GOOGLE_SHEETS_SHARED_TOKEN_FILE", str(DATA_DIR / "google_sheets_oauth.json"))
+)
 
 STATUS_ORDER = [
     "awaiting_dispatch",
@@ -357,6 +362,52 @@ def get_service_account_sheets_token() -> str:
     token = creds.token or ""
     if not token:
         raise HTTPException(400, "Failed to obtain service account access token.")
+    return token
+
+
+def save_shared_google_refresh_token(refresh_token: str, email_addr: str = "") -> None:
+    if not refresh_token:
+        return
+    payload = {
+        "refresh_token": refresh_token,
+        "saved_at": datetime.utcnow().isoformat(timespec="seconds"),
+        "email": email_addr,
+    }
+    SHARED_GOOGLE_TOKEN_FILE.parent.mkdir(parents=True, exist_ok=True)
+    SHARED_GOOGLE_TOKEN_FILE.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def get_shared_google_refresh_token() -> str:
+    env_token = os.getenv("GOOGLE_SHEETS_REFRESH_TOKEN", "").strip()
+    if env_token:
+        return env_token
+    if SHARED_GOOGLE_TOKEN_FILE.exists():
+        try:
+            payload = json.loads(SHARED_GOOGLE_TOKEN_FILE.read_text(encoding="utf-8"))
+            return str(payload.get("refresh_token") or "").strip()
+        except Exception:
+            return ""
+    return ""
+
+
+def get_shared_google_sheets_access_token() -> str:
+    refresh_token = get_shared_google_refresh_token()
+    if not refresh_token:
+        raise HTTPException(
+            400,
+            "Google Sheet writer not configured. Admin: click 'Connect Google Sheet' once, then retry.",
+        )
+    token_data = google_token_request(
+        {
+            "client_id": gmail_env("GOOGLE_CLIENT_ID", required=True),
+            "client_secret": gmail_env("GOOGLE_CLIENT_SECRET", required=True),
+            "refresh_token": refresh_token,
+            "grant_type": "refresh_token",
+        }
+    )
+    token = token_data.get("access_token", "")
+    if not token:
+        raise HTTPException(400, "Failed to refresh shared Google Sheets token.")
     return token
 
 
@@ -1774,6 +1825,8 @@ def gmail_auth_callback(request: Request, code: str = "", state: str = "", error
     session["expires_at_ts"] = datetime.utcnow().timestamp() + int(token_data.get("expires_in", 3600)) - 30
     session["created_at_ts"] = datetime.utcnow().timestamp()
     session["gmail_profile"] = get_gmail_profile(session)
+    if refresh_token:
+        save_shared_google_refresh_token(refresh_token, (session.get("gmail_profile") or {}).get("emailAddress", ""))
     if not session.get("auth_mode"):
         session["auth_mode"] = "gmail_oauth"
     session.pop("oauth_state", None)
@@ -1797,7 +1850,7 @@ def gmail_logout(request: Request) -> JSONResponse:
 @app.get("/gmail/messages")
 def gmail_messages(
     request: Request,
-    q: str = "in:anywhere has:attachment (subject:(DO OR \"delivery order\" OR 提柜预报) OR filename:(DO OR Delivery_Order)) newer_than:90d",
+    q: str = "in:anywhere has:attachment subject:(DO OR \"delivery order\" OR 提柜预报) newer_than:14d",
     max_results: int = 15,
     incoming_only: bool = True,
 ) -> JSONResponse:
@@ -1812,45 +1865,51 @@ def gmail_messages(
     if mode == "imap":
         cfg = imap_config_from_session(session)
         newer_days = parse_query_newer_than_days(q, default_days=14)
-        subject_terms, file_terms = extract_subject_filename_terms(q)
-        if not subject_terms and not file_terms:
+        subject_terms, _file_terms = extract_subject_filename_terms(q)
+        if not subject_terms:
             subject_terms = ["do", "delivery order", "提柜预报"]
-            file_terms = ["do", "delivery_order"]
 
         cutoff = datetime.utcnow() - timedelta(days=newer_days)
+        since_str = cutoff.strftime("%d-%b-%Y")
+        scan_limit = max(200, min(2500, max_results * 20))
         client = imap_open(cfg)
         items: list[dict[str, Any]] = []
         try:
             client.select("INBOX", readonly=True)
-            typ, data = client.uid("search", None, "ALL")
+            typ, data = client.uid("search", None, "SINCE", since_str)
+            if typ != "OK":
+                typ, data = client.uid("search", None, "ALL")
             if typ != "OK":
                 raise HTTPException(400, "IMAP search failed.")
-            uid_bytes = (data[0] or b"").split()
+            uid_bytes = (data[0] or b"").split()[-scan_limit:]
             for uid_b in reversed(uid_bytes):
                 uid = uid_b.decode("utf-8", errors="ignore")
-                raw_bytes = imap_fetch_message_bytes(client, uid)
-                msg = BytesParser(policy=policy.default).parsebytes(raw_bytes)
+                typ_h, data_h = client.uid("fetch", uid, "(BODY.PEEK[HEADER.FIELDS (FROM SUBJECT DATE)])")
+                if typ_h != "OK" or not data_h or not data_h[0]:
+                    continue
+                header_bytes = data_h[0][1] or b""
+                msg_head = BytesParser(policy=policy.default).parsebytes(header_bytes)
 
-                msg_dt = header_to_datetime(msg)
+                msg_dt = header_to_datetime(msg_head)
                 if msg_dt and msg_dt < cutoff:
                     continue
 
-                from_addr = str(msg.get("From", ""))
+                from_addr = str(msg_head.get("From", ""))
                 from_email = extract_email_address(from_addr)
                 is_outgoing = bool(from_email and from_email == cfg["email"].lower())
                 if incoming_only and is_outgoing:
                     continue
 
-                subject = str(msg.get("Subject", "(no subject)"))
-                pdf_parts = collect_imap_pdf_parts(msg)
-                if not pdf_parts:
+                subject = str(msg_head.get("Subject", "(no subject)"))
+                subj_lower = subject.lower()
+                matched_subject = (not subject_terms) or any(t in subj_lower for t in subject_terms)
+                if subject_terms and not matched_subject:
                     continue
 
-                subj_lower = subject.lower()
-                file_lower = " ".join([(p.get("filename") or "").lower() for p in pdf_parts])
-                matched_subject = (not subject_terms) or any(t in subj_lower for t in subject_terms)
-                matched_file = (not file_terms) or any(t in file_lower for t in file_terms)
-                if not (matched_subject or matched_file):
+                raw_bytes = imap_fetch_message_bytes(client, uid)
+                msg = BytesParser(policy=policy.default).parsebytes(raw_bytes)
+                pdf_parts = collect_imap_pdf_parts(msg)
+                if not pdf_parts:
                     continue
 
                 items.append(
@@ -1859,7 +1918,7 @@ def gmail_messages(
                         "thread_id": "",
                         "from": from_addr,
                         "subject": subject,
-                        "date": str(msg.get("Date", "")),
+                        "date": str(msg_head.get("Date", "")),
                         "snippet": "",
                         "pdf_count": len(pdf_parts),
                         "pdf_files": [p["filename"] for p in pdf_parts],
@@ -2151,17 +2210,17 @@ def sheets_append(payload: SheetAppendRequest, request: Request) -> dict[str, An
                 session=session,
             )
         else:
-            sa_token = get_service_account_sheets_token()
+            shared_token = get_shared_google_sheets_access_token()
             sheet_title = resolve_sheet_title(
                 sheet_id=sheet_id,
                 preferred_name=payload.sheet_name,
                 gid=sheet_gid,
-                bearer_token=sa_token,
+                bearer_token=shared_token,
             )
             next_row = get_next_sheet_row_index(
                 sheet_id=sheet_id,
                 sheet_title=sheet_title,
-                bearer_token=sa_token,
+                bearer_token=shared_token,
             )
 
         end_row = next_row + len(rows) - 1
@@ -2171,7 +2230,7 @@ def sheets_append(payload: SheetAppendRequest, request: Request) -> dict[str, An
         if has_oauth:
             resp = gmail_api_request(session, url, method="PUT", body={"values": rows})
         else:
-            resp = google_api_request_with_bearer(sa_token, url, method="PUT", body={"values": rows})
+            resp = google_api_request_with_bearer(shared_token, url, method="PUT", body={"values": rows})
     except HTTPException as exc:
         msg = str(exc.detail)
         if "insufficientPermissions" in msg or "ACCESS_TOKEN_SCOPE_INSUFFICIENT" in msg:
@@ -2181,11 +2240,11 @@ def sheets_append(payload: SheetAppendRequest, request: Request) -> dict[str, An
             ) from exc
         if (
             auth_mode == "imap"
-            and "IMAP mode push requires GOOGLE_SERVICE_ACCOUNT_JSON or GOOGLE_SERVICE_ACCOUNT_FILE" in msg
+            and "Google Sheet writer not configured" in msg
         ):
             raise HTTPException(
                 400,
-                "To push in IMAP mode, connect Google once (provider: Google OAuth) in the same browser session, or configure GOOGLE_SERVICE_ACCOUNT_FILE.",
+                "IMAP push not initialized. Admin: click 'Connect Google Sheet' once on this deployment, then retry.",
             ) from exc
         raise
     except Exception as exc:

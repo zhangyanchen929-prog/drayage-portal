@@ -142,7 +142,7 @@
   <section class="panel">
     <div class="sub" style="margin-bottom:8px">Email Search Query</div>
     <div class="row">
-      <input id="query-input" value='in:anywhere has:attachment (subject:(DO OR "delivery order" OR 提柜预报) OR filename:(DO OR Delivery_Order)) newer_than:1d'>
+      <input id="query-input" value='in:anywhere has:attachment subject:(DO OR "delivery order" OR 提柜预报) newer_than:1d'>
       <select id="limit-select" title="Number of emails to load">
         <option value="14" selected>14</option>
         <option value="10">10</option>
@@ -344,7 +344,22 @@
   }
 
   async function api(path, options = {}) {
-    const res = await fetch(path, options);
+    const timeoutMs = Number(options.timeoutMs || 90000);
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    const fetchOptions = { ...options, signal: controller.signal };
+    delete fetchOptions.timeoutMs;
+    let res;
+    try {
+      res = await fetch(path, fetchOptions);
+    } catch (err) {
+      if (err && err.name === "AbortError") {
+        throw new Error("Request timeout. Try smaller limit (10/14) or narrower date range.");
+      }
+      throw err;
+    } finally {
+      clearTimeout(timer);
+    }
     const text = await res.text();
     let data = {};
     if (text) {
@@ -485,7 +500,8 @@
       const data = await api(
         "/gmail/messages?q=" + encodeURIComponent(q) +
         "&max_results=" + encodeURIComponent(String(limit)) +
-        "&incoming_only=1"
+        "&incoming_only=1",
+        { timeoutMs: 120000 }
       );
       const rows = data.items || [];
       lastLoadedRows = rows;
