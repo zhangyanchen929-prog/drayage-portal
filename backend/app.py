@@ -606,9 +606,6 @@ def resolve_sheet_title(
         if isinstance(sid, int) and title:
             gid_map[sid] = title
 
-    if gid is not None and gid in gid_map:
-        return gid_map[gid]
-
     preferred = (preferred_name or "").strip()
     if preferred:
         for t in titles:
@@ -617,6 +614,9 @@ def resolve_sheet_title(
         for t in titles:
             if t.lower() == preferred.lower():
                 return t
+
+    if gid is not None and gid in gid_map:
+        return gid_map[gid]
 
     if titles:
         return titles[0]

@@ -98,6 +98,11 @@
     .card { background: var(--surface2); border: 1px solid var(--border); border-radius: 8px; padding: 10px; }
     .label { color: var(--muted); font-size: .68rem; font-family: var(--mono); text-transform: uppercase; }
     .value { margin-top: 4px; font-size: .95rem; }
+    .batch-wrap { margin-top: 12px; display: none; }
+    .batch-item { border: 1px solid var(--border); border-radius: 10px; background: #12192a; padding: 10px; margin-bottom: 8px; }
+    .batch-head { display:flex; justify-content:space-between; gap:10px; align-items:center; margin-bottom:8px; }
+    .batch-title { font-family: var(--mono); font-size:.78rem; color: var(--text); }
+    .batch-status { font-family: var(--mono); font-size:.74rem; }
     pre {
       margin: 0;
       border: 1px solid var(--border);
@@ -144,25 +149,27 @@
     <div class="row">
       <input id="query-input" value='in:anywhere has:attachment subject:(DO OR "delivery order" OR 提柜预报) newer_than:1d'>
       <select id="limit-select" title="Number of emails to load">
-        <option value="14" selected>14</option>
-        <option value="10">10</option>
+        <option value="15" selected>15</option>
+        <option value="30">30</option>
         <option value="50">50</option>
-        <option value="100">100</option>
-        <option value="200">200</option>
+        <option value="75">75</option>
       </select>
       <button id="load-btn">Load Emails</button>
+      <button id="select-page-btn">Select Page</button>
+      <button id="clear-select-btn">Clear</button>
+      <button id="clear-added-btn">Reset Added Flags</button>
+      <button id="bulk-extract-btn">Extract Selected</button>
+      <button id="bulk-push-btn" disabled>Push Selected</button>
     </div>
     <div class="row" style="margin-top:8px;">
       <button id="range-1">1D</button>
       <button id="range-3">3D</button>
-      <button id="range-7">7D</button>
-      <button id="range-14">14D</button>
     </div>
     <div class="status" id="list-status"></div>
     <div style="margin-top:10px; overflow:auto;">
       <table>
         <thead>
-          <tr><th>Subject</th><th>From</th><th>Date</th><th>PDF</th><th>Action</th></tr>
+          <tr><th style="width:40px;"><input type="checkbox" id="select-all-cb" title="Select all on current page"></th><th>Subject</th><th>From</th><th>Date</th><th>PDF</th><th>Action</th></tr>
         </thead>
         <tbody id="msg-table"></tbody>
       </table>
@@ -179,7 +186,7 @@
       <div class="sub">Extracted Result</div>
       <div class="row">
         <button id="sheet-google-auth-btn">Connect Google Sheet</button>
-        <button id="push-sheet-btn" disabled>Push To Sheet</button>
+        <button id="push-sheet-btn" disabled>Push Current Only</button>
         <button id="raw-btn" disabled>Show Raw Text</button>
         <button id="copy-btn" disabled>Copy JSON</button>
         <button id="download-btn" disabled>Download JSON</button>
@@ -203,6 +210,10 @@
       <div class="card"><div class="label">Weight KG</div><div class="value" id="s-weight">-</div></div>
     </div>
     <div class="status" id="process-status"></div>
+    <div class="batch-wrap" id="batch-wrap">
+      <div class="sub" style="margin-bottom:8px;">Batch Results</div>
+      <div id="batch-list"></div>
+    </div>
     <div class="sub" id="result-list-label" style="display:none; margin:8px 0 6px;">Attachments in this email</div>
     <div class="row" id="result-list" style="display:none; margin-bottom:10px;"></div>
     <pre id="raw-box" style="display:none; margin-bottom:10px"></pre>
@@ -214,10 +225,14 @@
   let lastJson = null;
   let lastRawText = "";
   let lastAttachmentResults = [];
+  let batchAttachmentMap = {};
+  let batchPreparedItems = [];
+  let lastBatchSummaries = [];
   let lastLoadedRows = [];
   let currentMessageId = "";
   let currentPage = 1;
   const PAGE_SIZE = 10;
+  const selectedMessageIds = new Set();
   const PUSHED_STORE_KEY = "gmail_do_sheet_pushed_v1";
 
   function loadPushedMap() {
@@ -238,9 +253,10 @@
     return m ? m[1] : raw;
   }
 
-  function pushedKey(messageId) {
+  function pushedKey(messageId, sheetNameOverride = "") {
     const sheetId = extractSheetId(document.getElementById("sheet-url-input").value.trim());
-    return sheetId + "::" + messageId;
+    const sheetName = ((sheetNameOverride || document.getElementById("sheet-name-input").value || "Sheet1")).trim().toLowerCase();
+    return sheetId + "::" + sheetName + "::" + messageId;
   }
 
   function getMessageById(messageId) {
@@ -285,22 +301,30 @@
     return { sheetName: defaultSheetName, matched: "" };
   }
 
-  function isMessagePushed(messageId) {
+  function isMessagePushed(messageId, sheetNameOverride = "") {
     const map = loadPushedMap();
-    return !!map[pushedKey(messageId)];
+    return !!map[pushedKey(messageId, sheetNameOverride)];
   }
 
   function markMessagePushed(messageId, meta) {
     const map = loadPushedMap();
-    map[pushedKey(messageId)] = {
+    map[pushedKey(messageId, meta?.sheet_name || "")] = {
       at: new Date().toISOString(),
-      rows: meta?.rows || 0
+      rows: meta?.rows || 0,
+      sheet_name: (meta?.sheet_name || "").trim()
     };
     savePushedMap(map);
   }
 
+  function clearAddedFlags() {
+    localStorage.removeItem(PUSHED_STORE_KEY);
+    renderMessageTable();
+    setStatus("sheet-status", "Added flags cleared for this browser.", "ok");
+  }
+
   function renderMessageTable() {
     const tbody = document.getElementById("msg-table");
+    const selectAllCb = document.getElementById("select-all-cb");
     const pagerWrap = document.getElementById("pager-wrap");
     const pagerInfo = document.getElementById("pager-info");
     const prevBtn = document.getElementById("pager-prev");
@@ -312,9 +336,16 @@
     if (currentPage < 1) currentPage = 1;
     const start = (currentPage - 1) * PAGE_SIZE;
     const pageRows = lastLoadedRows.slice(start, start + PAGE_SIZE);
+    const pageIds = pageRows.map((r) => r.id);
+    const selectedOnPage = pageIds.filter((id) => selectedMessageIds.has(id)).length;
+    if (selectAllCb) {
+      selectAllCb.checked = pageIds.length > 0 && selectedOnPage === pageIds.length;
+      selectAllCb.indeterminate = selectedOnPage > 0 && selectedOnPage < pageIds.length;
+    }
 
     tbody.innerHTML = pageRows.map((row) => `
       <tr>
+        <td><input type="checkbox" class="row-select-cb" data-mid="${row.id}" ${selectedMessageIds.has(row.id) ? "checked" : ""}></td>
         <td>${escapeHtml(row.subject || "")}<div class="sub">${escapeHtml(row.snippet || "")}</div></td>
         <td>${escapeHtml(row.from || "")}</td>
         <td>${escapeHtml(row.date || "")}</td>
@@ -329,6 +360,15 @@
         </td>
       </tr>
     `).join("");
+    tbody.querySelectorAll(".row-select-cb").forEach((cb) => {
+      cb.addEventListener("change", () => {
+        const mid = cb.getAttribute("data-mid");
+        if (!mid) return;
+        if (cb.checked) selectedMessageIds.add(mid);
+        else selectedMessageIds.delete(mid);
+        renderMessageTable();
+      });
+    });
 
     if (total > PAGE_SIZE) {
       pagerWrap.style.display = "flex";
@@ -354,7 +394,7 @@
       res = await fetch(path, fetchOptions);
     } catch (err) {
       if (err && err.name === "AbortError") {
-        throw new Error("Request timeout. Try smaller limit (10/14) or narrower date range.");
+        throw new Error("Request timeout. Try smaller limit (15/30) or narrower date range.");
       }
       throw err;
     } finally {
@@ -481,6 +521,8 @@
     document.getElementById("result-list-label").style.display = "none";
     document.getElementById("result-list").style.display = "none";
     document.getElementById("result-list").innerHTML = "";
+    document.getElementById("batch-wrap").style.display = "none";
+    document.getElementById("batch-list").innerHTML = "";
     document.getElementById("sheet-status").textContent = "";
     document.getElementById("push-sheet-btn").disabled = true;
     document.getElementById("raw-btn").disabled = true;
@@ -501,10 +543,11 @@
         "/gmail/messages?q=" + encodeURIComponent(q) +
         "&max_results=" + encodeURIComponent(String(limit)) +
         "&incoming_only=1",
-        { timeoutMs: 120000 }
+        { timeoutMs: 180000 }
       );
       const rows = data.items || [];
       lastLoadedRows = rows;
+      selectedMessageIds.clear();
       currentPage = 1;
       renderMessageTable();
       setStatus("list-status", "Loaded " + rows.length + " email(s).", "ok");
@@ -540,6 +583,62 @@
     document.getElementById("s-deliver").textContent = ((d.deliver_to || {}).company) || "-";
     document.getElementById("s-weight").textContent = totalKg.toLocaleString() + " KG";
     document.getElementById("summary-grid").style.display = "grid";
+  }
+
+  function summaryFromResult(resultObj) {
+    const d = (((resultObj || {}).delivery_order) || {});
+    const containers = d.containers || [];
+    const totalKg = containers.reduce((sum, c) => sum + (Number(c.weight_kg) || 0), 0);
+    return {
+      shipment_ref: d.shipment_reference || "-",
+      vessel: ((d.shipment || {}).vessel_name) || "-",
+      arrival: ((d.shipment || {}).arrival_date) || "-",
+      containers: `${containers.length} container(s)`,
+      deliver_to: ((d.deliver_to || {}).company) || "-",
+      weight_kg: `${totalKg.toLocaleString()} KG`
+    };
+  }
+
+  function renderBatchSummaries(items) {
+    const wrap = document.getElementById("batch-wrap");
+    const list = document.getElementById("batch-list");
+    if (!items || !items.length) {
+      wrap.style.display = "none";
+      list.innerHTML = "";
+      return;
+    }
+    list.innerHTML = items.map((it) => `
+      <div class="batch-item">
+        <div class="batch-head">
+          <div class="batch-title">${escapeHtml(it.title || it.message_id || "")}</div>
+          <div class="batch-status ${it.ok ? "ok" : "err"}">${escapeHtml(it.status || "")}</div>
+        </div>
+        <div class="grid">
+          <div class="card"><div class="label">Shipment Ref</div><div class="value">${escapeHtml(it.shipment_ref || "-")}</div></div>
+          <div class="card"><div class="label">Vessel</div><div class="value">${escapeHtml(it.vessel || "-")}</div></div>
+          <div class="card"><div class="label">Arrival</div><div class="value">${escapeHtml(it.arrival || "-")}</div></div>
+          <div class="card"><div class="label">Containers</div><div class="value">${escapeHtml(it.containers || "-")}</div></div>
+          <div class="card"><div class="label">Deliver To</div><div class="value">${escapeHtml(it.deliver_to || "-")}</div></div>
+          <div class="card"><div class="label">Weight KG</div><div class="value">${escapeHtml(it.weight_kg || "-")}</div></div>
+        </div>
+      </div>
+    `).join("");
+    wrap.style.display = "block";
+  }
+
+  function syncPushButtons() {
+    const singleBtn = document.getElementById("push-sheet-btn");
+    const bulkBtn = document.getElementById("bulk-push-btn");
+    const hasBatch = (batchPreparedItems || []).length > 0;
+    if (hasBatch) {
+      singleBtn.textContent = "Push To Sheet";
+      singleBtn.disabled = false;
+      bulkBtn.disabled = false;
+      return;
+    }
+    singleBtn.textContent = "Push Current Only";
+    singleBtn.disabled = !lastAttachmentResults.some((x) => x.result);
+    bulkBtn.disabled = true;
   }
 
   function showResultByIndex(index) {
@@ -588,6 +687,9 @@
 
   async function processMessage(messageId) {
     currentMessageId = messageId;
+    batchPreparedItems = [];
+    lastBatchSummaries = [];
+    renderBatchSummaries([]);
     setStatus("process-status", "Processing PDF attachments...");
     try {
       const data = await api("/gmail/process", {
@@ -604,7 +706,7 @@
       }
       const firstSuccessIndex = items.findIndex((x) => x.result);
       showResultByIndex(firstSuccessIndex);
-      document.getElementById("push-sheet-btn").disabled = !items.some((x) => x.result);
+      syncPushButtons();
       const okCount = items.filter((x) => x.result).length;
       const failCount = items.length - okCount;
       setStatus(
@@ -667,7 +769,7 @@
       });
       const routeNote = route.matched ? (" (routed by: " + route.matched + ")") : "";
       setStatus("sheet-status", "Sheet updated: " + data.rows_appended + " row(s) appended to " + data.sheet_name + routeNote + ".", "ok");
-      markMessagePushed(currentMessageId, { rows: data.rows_appended || 0 });
+      markMessagePushed(currentMessageId, { rows: data.rows_appended || 0, sheet_name: data.sheet_name || sheetName });
       const marker = document.getElementById("pushed-" + currentMessageId);
       if (marker) {
         marker.textContent = "Added to Sheet";
@@ -677,6 +779,176 @@
     } catch (err) {
       setStatus("sheet-status", err.message, "err");
     }
+  }
+
+  function selectCurrentPage() {
+    const start = (currentPage - 1) * PAGE_SIZE;
+    const pageRows = lastLoadedRows.slice(start, start + PAGE_SIZE);
+    pageRows.forEach((r) => selectedMessageIds.add(r.id));
+    renderMessageTable();
+  }
+
+  function clearSelection() {
+    selectedMessageIds.clear();
+    renderMessageTable();
+  }
+
+  async function bulkExtractSelected() {
+    if (!selectedMessageIds.size) {
+      setStatus("sheet-status", "Please select at least one email.", "err");
+      return;
+    }
+    const defaultSheetName = document.getElementById("sheet-name-input").value.trim() || "Sheet1";
+
+    const ids = Array.from(selectedMessageIds);
+    batchAttachmentMap = {};
+    batchPreparedItems = [];
+    let okCount = 0;
+    let failCount = 0;
+    const batchItems = [];
+
+    for (let i = 0; i < ids.length; i++) {
+      const messageId = ids[i];
+      setStatus("process-status", `Extracting ${i + 1}/${ids.length}...`, "");
+      try {
+        const proc = await api("/gmail/process", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ message_id: messageId }),
+          timeoutMs: 180000
+        });
+        const attachments = (proc.attachments || []).filter((x) => x.result);
+        if (!attachments.length) {
+          failCount += 1;
+          const msg = getMessageById(messageId);
+          batchItems.push({
+            message_id: messageId,
+            title: (msg && msg.subject) ? msg.subject : messageId,
+            ok: false,
+            status: "Extract failed",
+            has_details: false,
+            shipment_ref: "-",
+            vessel: "-",
+            arrival: "-",
+            containers: "-",
+            deliver_to: "-",
+            weight_kg: "-"
+          });
+          continue;
+        }
+        batchAttachmentMap[messageId] = attachments;
+        const first = attachments[0].result;
+        const sum = summaryFromResult(first);
+        const route = chooseSheetByRules(messageId, attachments, defaultSheetName);
+        batchPreparedItems.push({
+          message_id: messageId,
+          route_sheet_name: route.sheetName,
+          attachments
+        });
+        okCount += 1;
+        const msg = getMessageById(messageId);
+        batchItems.push({
+          message_id: messageId,
+          title: (msg && msg.subject) ? msg.subject : messageId,
+          ok: true,
+          status: "Extracted",
+          has_details: true,
+          ...sum
+        });
+      } catch (err) {
+        failCount += 1;
+        const msg = getMessageById(messageId);
+          batchItems.push({
+            message_id: messageId,
+            title: (msg && msg.subject) ? msg.subject : messageId,
+            ok: false,
+            status: "Failed",
+            has_details: false,
+            shipment_ref: "-",
+            vessel: "-",
+            arrival: "-",
+            containers: "-",
+            deliver_to: "-",
+            weight_kg: "-"
+          });
+      }
+    }
+
+    lastBatchSummaries = batchItems;
+    renderBatchSummaries(lastBatchSummaries);
+    // In batch view, hide single-item summary to avoid duplicate card.
+    currentMessageId = "";
+    lastAttachmentResults = [];
+    document.getElementById("summary-grid").style.display = "none";
+    document.getElementById("result-list-label").style.display = "none";
+    document.getElementById("result-list").style.display = "none";
+    document.getElementById("result-list").innerHTML = "";
+    document.getElementById("json-box").textContent = "{}";
+    document.getElementById("raw-box").textContent = "";
+    document.getElementById("raw-box").style.display = "none";
+    document.getElementById("raw-btn").disabled = true;
+    document.getElementById("copy-btn").disabled = true;
+    document.getElementById("download-btn").disabled = true;
+    syncPushButtons();
+
+    renderMessageTable();
+    setStatus("process-status", `Bulk extract done: ${okCount} extracted, ${failCount} failed.`, failCount ? "err" : "ok");
+    setStatus("sheet-status", batchPreparedItems.length ? "Ready to push selected extracted items." : "No extracted items to push.", batchPreparedItems.length ? "ok" : "err");
+  }
+
+  async function pushSelectedPrepared() {
+    if (!batchPreparedItems.length) {
+      setStatus("sheet-status", "Please run Extract Selected first.", "err");
+      return;
+    }
+    const sheetIdOrUrl = document.getElementById("sheet-url-input").value.trim();
+    if (!sheetIdOrUrl) {
+      setStatus("sheet-status", "Please provide Google Sheet URL or ID.", "err");
+      return;
+    }
+
+    let pushed = 0;
+    let skipped = 0;
+    let failed = 0;
+    for (let i = 0; i < batchPreparedItems.length; i++) {
+      const item = batchPreparedItems[i];
+      const messageId = item.message_id;
+      const sheetName = item.route_sheet_name || (document.getElementById("sheet-name-input").value.trim() || "Sheet1");
+      if (isMessagePushed(messageId, sheetName)) {
+        skipped += 1;
+        continue;
+      }
+      setStatus("sheet-status", `Pushing ${i + 1}/${batchPreparedItems.length}...`, "");
+      try {
+        const resp = await api("/sheets/append", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            sheet_id_or_url: sheetIdOrUrl,
+            sheet_name: sheetName,
+            attachments: item.attachments
+          }),
+          timeoutMs: 120000
+        });
+        markMessagePushed(messageId, { rows: item.attachments.length, sheet_name: resp.sheet_name || sheetName });
+        pushed += 1;
+      } catch (_) {
+        failed += 1;
+      }
+    }
+    renderMessageTable();
+    // Update statuses in batch cards.
+    lastBatchSummaries = lastBatchSummaries.map((x) => {
+      const prepared = batchPreparedItems.find((p) => p.message_id === x.message_id);
+      if (!prepared) return x;
+      const sn = prepared.route_sheet_name || "";
+      if (isMessagePushed(x.message_id, sn)) return { ...x, status: "Pushed", ok: true };
+      return x;
+    });
+    renderBatchSummaries(lastBatchSummaries);
+    document.getElementById("summary-grid").style.display = "none";
+    syncPushButtons();
+    setStatus("sheet-status", `Bulk push done: ${pushed} pushed, ${skipped} skipped, ${failed} failed.`, failed ? "err" : "ok");
   }
 
   function toggleRawText() {
@@ -696,6 +968,21 @@
   document.getElementById("sheet-google-auth-btn").addEventListener("click", connectGoogleSheet);
   document.getElementById("logout-btn").addEventListener("click", logoutGoogle);
   document.getElementById("load-btn").addEventListener("click", loadMessages);
+  document.getElementById("select-page-btn").addEventListener("click", selectCurrentPage);
+  document.getElementById("clear-select-btn").addEventListener("click", clearSelection);
+  document.getElementById("clear-added-btn").addEventListener("click", clearAddedFlags);
+  document.getElementById("bulk-extract-btn").addEventListener("click", bulkExtractSelected);
+  document.getElementById("bulk-push-btn").addEventListener("click", pushSelectedPrepared);
+  document.getElementById("select-all-cb").addEventListener("change", (ev) => {
+    const checked = !!ev.target.checked;
+    const start = (currentPage - 1) * PAGE_SIZE;
+    const pageRows = lastLoadedRows.slice(start, start + PAGE_SIZE);
+    pageRows.forEach((r) => {
+      if (checked) selectedMessageIds.add(r.id);
+      else selectedMessageIds.delete(r.id);
+    });
+    renderMessageTable();
+  });
   document.getElementById("sheet-url-input").addEventListener("change", () => {
     if (!lastLoadedRows.length) return;
     renderMessageTable();
@@ -713,14 +1000,19 @@
   });
   document.getElementById("range-1").addEventListener("click", () => setRangeAndReload(1));
   document.getElementById("range-3").addEventListener("click", () => setRangeAndReload(3));
-  document.getElementById("range-7").addEventListener("click", () => setRangeAndReload(7));
-  document.getElementById("range-14").addEventListener("click", () => setRangeAndReload(14));
-  document.getElementById("push-sheet-btn").addEventListener("click", pushToSheet);
+  document.getElementById("push-sheet-btn").addEventListener("click", () => {
+    if ((batchPreparedItems || []).length > 0) {
+      pushSelectedPrepared();
+      return;
+    }
+    pushToSheet();
+  });
   document.getElementById("raw-btn").addEventListener("click", toggleRawText);
   document.getElementById("copy-btn").addEventListener("click", copyJson);
   document.getElementById("download-btn").addEventListener("click", downloadJson);
 
   refreshProviderUI();
+  syncPushButtons();
   loadSession().catch((err) => setStatus("session-status", err.message, "err"));
   if (window.location.search.includes("connected=1")) {
     setStatus("session-status", "Google account connected.", "ok");
