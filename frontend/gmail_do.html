@@ -198,7 +198,7 @@
     </div>
     <div class="sub" style="margin-bottom:8px;">提示：邮件来源可继续使用 IMAP；`Connect Google Sheet` 只用于写入表格授权。</div>
     <div class="row" style="margin-bottom:10px;">
-      <input id="routing-input" value="pegaso=Sheet1, vail=Sheet2" placeholder="Routing rules: customer=sheet, e.g. pegaso=Sheet1, vail=Sheet2">
+      <input id="routing-input" value="pegaso=PEGASO, vail=VAIL, mz fashion=MZ Fashion" placeholder="Routing rules: customer=sheet, e.g. pegaso=PEGASO, vail=VAIL, mz fashion=MZ Fashion">
     </div>
     <div class="status" id="sheet-status"></div>
     <div class="grid" id="summary-grid" style="display:none">
@@ -306,6 +306,14 @@
     return !!map[pushedKey(messageId, sheetNameOverride)];
   }
 
+  function isMessagePushedAnySheet(messageId) {
+    const map = loadPushedMap();
+    const sheetId = extractSheetId(document.getElementById("sheet-url-input").value.trim());
+    const suffix = "::" + messageId;
+    const prefix = sheetId + "::";
+    return Object.keys(map).some((k) => k.startsWith(prefix) && k.endsWith(suffix));
+  }
+
   function markMessagePushed(messageId, meta) {
     const map = loadPushedMap();
     map[pushedKey(messageId, meta?.sheet_name || "")] = {
@@ -354,11 +362,11 @@
           <div class="row">
             <button onclick="processMessage('${row.id}')">Extract</button>
           </div>
-          <div class="sub ${isMessagePushed(row.id) ? "ok" : ""}" id="pushed-${row.id}" style="margin-top:6px;">
-            ${isMessagePushed(row.id) ? "Added to Sheet" : ""}
-          </div>
-        </td>
-      </tr>
+            <div class="sub ${isMessagePushedAnySheet(row.id) ? "ok" : ""}" id="pushed-${row.id}" style="margin-top:6px;">
+              ${isMessagePushedAnySheet(row.id) ? "Added to Sheet" : ""}
+            </div>
+          </td>
+        </tr>
     `).join("");
     tbody.querySelectorAll(".row-select-cb").forEach((cb) => {
       cb.addEventListener("change", () => {
@@ -746,16 +754,16 @@
       setStatus("sheet-status", "Please provide Google Sheet URL or ID.", "err");
       return;
     }
-    if (isMessagePushed(currentMessageId)) {
-      setStatus("sheet-status", "This email is already added to the current sheet.", "err");
-      return;
-    }
     if (!attachments.length) {
       setStatus("sheet-status", "No successful extracted results to push.", "err");
       return;
     }
     const route = chooseSheetByRules(currentMessageId, attachments, defaultSheetName);
     const sheetName = route.sheetName;
+    if (isMessagePushed(currentMessageId, sheetName)) {
+      setStatus("sheet-status", "This email is already added to " + sheetName + ".", "err");
+      return;
+    }
     setStatus("sheet-status", "Pushing rows to Google Sheet...");
     try {
       const data = await api("/sheets/append", {
