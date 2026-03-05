@@ -4,6 +4,10 @@ import sqlite3
 import zipfile
 import base64
 import io
+import imaplib
+from email import policy
+from email.parser import BytesParser
+from email.utils import parsedate_to_datetime
 from datetime import datetime
 from datetime import timedelta
 import hashlib
@@ -26,6 +30,8 @@ from pydantic import BaseModel
 from backend.db import UPLOAD_DIR, get_conn, init_db
 from backend.email_extractor import anthropic_extract
 from backend.seed import seed_data
+from google.auth.transport.requests import Request as GoogleRequest
+from google.oauth2 import service_account
 from pypdf import PdfReader
 
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -115,6 +121,13 @@ class UserRoleUpdate(BaseModel):
 
 class GmailProcessRequest(BaseModel):
     message_id: str
+
+
+class ImapConnectRequest(BaseModel):
+    email: str
+    password: str
+    host: str
+    port: int = 993
 
 
 class SheetAppendRequest(BaseModel):
@@ -284,6 +297,69 @@ def gmail_api_request(
         raise HTTPException(exc.code, f"Gmail API request failed: {body_text}") from exc
 
 
+def google_api_request_with_bearer(
+    token: str,
+    url: str,
+    method: str = "GET",
+    body: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    data_bytes = json.dumps(body).encode("utf-8") if body is not None else None
+    req = urllib.request.Request(
+        url=url,
+        method=method,
+        data=data_bytes,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            raw = resp.read().decode("utf-8")
+            return json.loads(raw) if raw else {}
+    except urllib.error.HTTPError as exc:
+        body_text = exc.read().decode("utf-8", errors="replace")
+        raise HTTPException(exc.code, f"Google API request failed: {body_text}") from exc
+
+
+def get_service_account_info() -> dict[str, Any]:
+    raw_json = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "").strip()
+    if raw_json:
+        try:
+            return json.loads(raw_json)
+        except json.JSONDecodeError as exc:
+            raise HTTPException(500, "GOOGLE_SERVICE_ACCOUNT_JSON is not valid JSON.") from exc
+
+    file_path = os.getenv("GOOGLE_SERVICE_ACCOUNT_FILE", "").strip()
+    if file_path:
+        try:
+            with open(file_path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except FileNotFoundError as exc:
+            raise HTTPException(500, f"GOOGLE_SERVICE_ACCOUNT_FILE not found: {file_path}") from exc
+        except json.JSONDecodeError as exc:
+            raise HTTPException(500, f"GOOGLE_SERVICE_ACCOUNT_FILE is not valid JSON: {file_path}") from exc
+
+    raise HTTPException(
+        400,
+        "IMAP mode push requires GOOGLE_SERVICE_ACCOUNT_JSON or GOOGLE_SERVICE_ACCOUNT_FILE.",
+    )
+
+
+def get_service_account_sheets_token() -> str:
+    info = get_service_account_info()
+    scopes = ["https://www.googleapis.com/auth/spreadsheets"]
+    try:
+        creds = service_account.Credentials.from_service_account_info(info, scopes=scopes)
+        creds.refresh(GoogleRequest())
+    except Exception as exc:
+        raise HTTPException(400, f"Service account auth failed: {exc}") from exc
+    token = creds.token or ""
+    if not token:
+        raise HTTPException(400, "Failed to obtain service account access token.")
+    return token
+
+
 def get_gmail_profile(session: dict[str, Any]) -> dict[str, Any]:
     return gmail_api_request(session, "https://gmail.googleapis.com/gmail/v1/users/me/profile")
 
@@ -331,6 +407,102 @@ def decode_base64url(value: str) -> bytes:
     return base64.urlsafe_b64decode(padded.encode("ascii"))
 
 
+def parse_query_newer_than_days(q: str, default_days: int = 14) -> int:
+    m = re.search(r"newer_than:(\d+)d", q or "", re.IGNORECASE)
+    if not m:
+        return default_days
+    try:
+        return max(1, int(m.group(1)))
+    except ValueError:
+        return default_days
+
+
+def parse_or_terms(fragment: str) -> list[str]:
+    if not fragment:
+        return []
+    text = fragment.replace('"', " ").replace("(", " ").replace(")", " ")
+    terms = []
+    for part in re.split(r"\bOR\b|,", text, flags=re.IGNORECASE):
+        t = part.strip().lower()
+        if t:
+            terms.append(t)
+    return terms
+
+
+def extract_subject_filename_terms(q: str) -> tuple[list[str], list[str]]:
+    subject_terms: list[str] = []
+    file_terms: list[str] = []
+
+    m_subject = re.search(r"subject:\((.*?)\)", q or "", re.IGNORECASE)
+    if m_subject:
+        subject_terms.extend(parse_or_terms(m_subject.group(1)))
+    m_file = re.search(r"filename:\((.*?)\)", q or "", re.IGNORECASE)
+    if m_file:
+        file_terms.extend(parse_or_terms(m_file.group(1)))
+
+    return subject_terms, file_terms
+
+
+def imap_config_from_session(session: dict[str, Any]) -> dict[str, Any]:
+    cfg = session.get("imap_config") or {}
+    host = (cfg.get("host") or "").strip()
+    email_addr = (cfg.get("email") or "").strip()
+    password = cfg.get("password") or ""
+    port = int(cfg.get("port") or 993)
+    if not host or not email_addr or not password:
+        raise HTTPException(401, "Not connected to IMAP.")
+    return {"host": host, "email": email_addr, "password": password, "port": port}
+
+
+def imap_open(cfg: dict[str, Any]) -> imaplib.IMAP4_SSL:
+    try:
+        client = imaplib.IMAP4_SSL(cfg["host"], cfg["port"])
+        client.login(cfg["email"], cfg["password"])
+        return client
+    except imaplib.IMAP4.error as exc:
+        raise HTTPException(401, f"IMAP login failed: {exc}") from exc
+    except Exception as exc:
+        raise HTTPException(400, f"IMAP connect failed: {exc}") from exc
+
+
+def collect_imap_pdf_parts(msg: Any) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    for part in msg.walk():
+        filename = (part.get_filename() or "").strip()
+        content_type = (part.get_content_type() or "").lower()
+        if not filename and content_type != "application/pdf":
+            continue
+        if content_type == "application/pdf" or filename.lower().endswith(".pdf"):
+            payload = part.get_payload(decode=True) or b""
+            out.append(
+                {
+                    "filename": filename or "attachment.pdf",
+                    "bytes": payload,
+                }
+            )
+    return out
+
+
+def header_to_datetime(msg: Any) -> datetime | None:
+    raw = msg.get("Date", "")
+    if not raw:
+        return None
+    try:
+        dt = parsedate_to_datetime(raw)
+        if dt and dt.tzinfo:
+            return dt.astimezone().replace(tzinfo=None)
+        return dt
+    except Exception:
+        return None
+
+
+def imap_fetch_message_bytes(client: imaplib.IMAP4_SSL, uid: str) -> bytes:
+    typ, data = client.uid("fetch", uid, "(RFC822)")
+    if typ != "OK" or not data or not data[0]:
+        raise HTTPException(404, f"Message not found: {uid}")
+    return data[0][1]
+
+
 def extract_sheet_id(sheet_id_or_url: str) -> str:
     raw = (sheet_id_or_url or "").strip()
     if not raw:
@@ -357,11 +529,20 @@ def quote_sheet_title(title: str) -> str:
     return f"'{t}'"
 
 
-def resolve_sheet_title(session: dict[str, Any], sheet_id: str, preferred_name: str, gid: int | None) -> str:
-    meta = gmail_api_request(
-        session,
-        f"https://sheets.googleapis.com/v4/spreadsheets/{sheet_id}?fields=sheets(properties(sheetId,title))",
-    )
+def resolve_sheet_title(
+    sheet_id: str,
+    preferred_name: str,
+    gid: int | None,
+    session: dict[str, Any] | None = None,
+    bearer_token: str = "",
+) -> str:
+    url = f"https://sheets.googleapis.com/v4/spreadsheets/{sheet_id}?fields=sheets(properties(sheetId,title))"
+    if bearer_token:
+        meta = google_api_request_with_bearer(bearer_token, url)
+    elif session is not None:
+        meta = gmail_api_request(session, url)
+    else:
+        raise HTTPException(500, "resolve_sheet_title requires session or bearer_token.")
     sheets = (meta or {}).get("sheets") or []
     titles: list[str] = []
     gid_map: dict[int, str] = {}
@@ -1465,12 +1646,46 @@ def gmail_do_page() -> FileResponse:
 def gmail_session(request: Request) -> JSONResponse:
     sid, session, created = get_or_create_gmail_session(request)
     profile = session.get("gmail_profile", {})
+    mode = session.get("auth_mode") or ""
+    authenticated = bool(session.get("access_token") or session.get("imap_config"))
+    email_addr = profile.get("emailAddress")
+    if mode == "imap":
+        email_addr = (session.get("imap_config") or {}).get("email", "")
     resp = JSONResponse(
         {
-            "authenticated": bool(session.get("access_token")),
-            "email": profile.get("emailAddress"),
+            "authenticated": authenticated,
+            "email": email_addr,
+            "mode": mode or None,
         }
     )
+    if created:
+        set_gmail_cookie(resp, sid)
+    return resp
+
+
+@app.post("/imap/connect")
+def imap_connect(payload: ImapConnectRequest, request: Request) -> JSONResponse:
+    sid, session, created = get_or_create_gmail_session(request)
+    email_addr = payload.email.strip().lower()
+    host = payload.host.strip()
+    port = int(payload.port or 993)
+    if not email_addr or not host:
+        raise HTTPException(400, "IMAP email and host are required.")
+
+    cfg = {
+        "email": email_addr,
+        "password": payload.password,
+        "host": host,
+        "port": port,
+    }
+    client = imap_open(cfg)
+    client.logout()
+
+    session["created_at_ts"] = session.get("created_at_ts") or datetime.utcnow().timestamp()
+    session["auth_mode"] = "imap"
+    session["imap_config"] = cfg
+
+    resp = JSONResponse({"ok": True, "mode": "imap", "email": email_addr})
     if created:
         set_gmail_cookie(resp, sid)
     return resp
@@ -1485,6 +1700,8 @@ def gmail_auth_start(request: Request) -> JSONResponse:
     state = secrets.token_urlsafe(24)
     session["oauth_state"] = state
     session["oauth_redirect_uri"] = redirect_uri
+    if "auth_mode" not in session:
+        session["auth_mode"] = "gmail_oauth"
 
     params = {
         "client_id": client_id,
@@ -1538,6 +1755,8 @@ def gmail_auth_callback(request: Request, code: str = "", state: str = "", error
     session["expires_at_ts"] = datetime.utcnow().timestamp() + int(token_data.get("expires_in", 3600)) - 30
     session["created_at_ts"] = datetime.utcnow().timestamp()
     session["gmail_profile"] = get_gmail_profile(session)
+    if not session.get("auth_mode"):
+        session["auth_mode"] = "gmail_oauth"
     session.pop("oauth_state", None)
     session.pop("oauth_redirect_uri", None)
 
@@ -1565,13 +1784,84 @@ def gmail_messages(
 ) -> JSONResponse:
     sid = request.cookies.get(GMAIL_COOKIE_NAME, "")
     session = GMAIL_OAUTH_SESSIONS.get(sid)
-    if not session or not session.get("access_token"):
+    if not session:
+        raise HTTPException(401, "Not connected.")
+
+    mode = session.get("auth_mode") or "gmail_oauth"
+    max_results = max(1, min(max_results, 200))
+
+    if mode == "imap":
+        cfg = imap_config_from_session(session)
+        newer_days = parse_query_newer_than_days(q, default_days=14)
+        subject_terms, file_terms = extract_subject_filename_terms(q)
+        if not subject_terms and not file_terms:
+            subject_terms = ["do", "delivery order", "提柜预报"]
+            file_terms = ["do", "delivery_order"]
+
+        cutoff = datetime.utcnow() - timedelta(days=newer_days)
+        client = imap_open(cfg)
+        items: list[dict[str, Any]] = []
+        try:
+            client.select("INBOX", readonly=True)
+            typ, data = client.uid("search", None, "ALL")
+            if typ != "OK":
+                raise HTTPException(400, "IMAP search failed.")
+            uid_bytes = (data[0] or b"").split()
+            for uid_b in reversed(uid_bytes):
+                uid = uid_b.decode("utf-8", errors="ignore")
+                raw_bytes = imap_fetch_message_bytes(client, uid)
+                msg = BytesParser(policy=policy.default).parsebytes(raw_bytes)
+
+                msg_dt = header_to_datetime(msg)
+                if msg_dt and msg_dt < cutoff:
+                    continue
+
+                from_addr = str(msg.get("From", ""))
+                from_email = extract_email_address(from_addr)
+                is_outgoing = bool(from_email and from_email == cfg["email"].lower())
+                if incoming_only and is_outgoing:
+                    continue
+
+                subject = str(msg.get("Subject", "(no subject)"))
+                pdf_parts = collect_imap_pdf_parts(msg)
+                if not pdf_parts:
+                    continue
+
+                subj_lower = subject.lower()
+                file_lower = " ".join([(p.get("filename") or "").lower() for p in pdf_parts])
+                matched_subject = (not subject_terms) or any(t in subj_lower for t in subject_terms)
+                matched_file = (not file_terms) or any(t in file_lower for t in file_terms)
+                if not (matched_subject or matched_file):
+                    continue
+
+                items.append(
+                    {
+                        "id": uid,
+                        "thread_id": "",
+                        "from": from_addr,
+                        "subject": subject,
+                        "date": str(msg.get("Date", "")),
+                        "snippet": "",
+                        "pdf_count": len(pdf_parts),
+                        "pdf_files": [p["filename"] for p in pdf_parts],
+                        "is_outgoing": is_outgoing,
+                    }
+                )
+                if len(items) >= max_results:
+                    break
+        finally:
+            try:
+                client.logout()
+            except Exception:
+                pass
+
+        return JSONResponse({"items": items})
+
+    if not session.get("access_token"):
         raise HTTPException(401, "Not connected to Gmail.")
 
     profile = session.get("gmail_profile") or get_gmail_profile(session)
     me_email = extract_email_address((profile or {}).get("emailAddress", ""))
-
-    max_results = max(1, min(max_results, 200))
     query = urllib.parse.urlencode({"q": q, "maxResults": str(max_results)})
     list_url = f"https://gmail.googleapis.com/gmail/v1/users/me/messages?{query}"
     listed = gmail_api_request(session, list_url)
@@ -1591,7 +1881,6 @@ def gmail_messages(
             continue
         pdf_parts: list[dict[str, Any]] = []
         collect_pdf_parts(payload, pdf_parts)
-
         items.append(
             {
                 "id": msg_id,
@@ -1612,20 +1901,52 @@ def gmail_messages(
 def gmail_process(payload: GmailProcessRequest, request: Request) -> dict[str, Any]:
     sid = request.cookies.get(GMAIL_COOKIE_NAME, "")
     session = GMAIL_OAUTH_SESSIONS.get(sid)
-    if not session or not session.get("access_token"):
-        raise HTTPException(401, "Not connected to Gmail.")
+    if not session:
+        raise HTTPException(401, "Not connected.")
 
     anthropic_key = gmail_env("ANTHROPIC_API_KEY", required=True)
     anthropic_model = gmail_env("ANTHROPIC_MODEL", "claude-haiku-4-5-20251001")
     anthropic_max_tokens = int(gmail_env("ANTHROPIC_MAX_TOKENS", "2048"))
 
-    detail_url = f"https://gmail.googleapis.com/gmail/v1/users/me/messages/{payload.message_id}?format=full"
-    detail = gmail_api_request(session, detail_url)
-    message_payload = detail.get("payload") or {}
-    headers = parse_header_map(message_payload.get("headers"))
-
+    mode = session.get("auth_mode") or "gmail_oauth"
+    headers: dict[str, str] = {}
     pdf_parts: list[dict[str, Any]] = []
-    collect_pdf_parts(message_payload, pdf_parts)
+    message_meta: dict[str, Any] = {"id": payload.message_id, "subject": "(no subject)", "from": "", "date": ""}
+
+    if mode == "imap":
+        cfg = imap_config_from_session(session)
+        client = imap_open(cfg)
+        try:
+            client.select("INBOX", readonly=True)
+            raw_bytes = imap_fetch_message_bytes(client, payload.message_id)
+            msg = BytesParser(policy=policy.default).parsebytes(raw_bytes)
+            message_meta["subject"] = str(msg.get("Subject", "(no subject)"))
+            message_meta["from"] = str(msg.get("From", ""))
+            message_meta["date"] = str(msg.get("Date", ""))
+            for part in collect_imap_pdf_parts(msg):
+                pdf_parts.append(
+                    {
+                        "filename": part["filename"],
+                        "pdf_bytes": part["bytes"],
+                    }
+                )
+        finally:
+            try:
+                client.logout()
+            except Exception:
+                pass
+    else:
+        if not session.get("access_token"):
+            raise HTTPException(401, "Not connected to Gmail.")
+        detail_url = f"https://gmail.googleapis.com/gmail/v1/users/me/messages/{payload.message_id}?format=full"
+        detail = gmail_api_request(session, detail_url)
+        message_payload = detail.get("payload") or {}
+        headers = parse_header_map(message_payload.get("headers"))
+        message_meta["subject"] = headers.get("subject", "(no subject)")
+        message_meta["from"] = headers.get("from", "")
+        message_meta["date"] = headers.get("date", "")
+        collect_pdf_parts(message_payload, pdf_parts)
+
     if not pdf_parts:
         raise HTTPException(400, "No PDF attachments found in this message.")
 
@@ -1636,7 +1957,9 @@ def gmail_process(payload: GmailProcessRequest, request: Request) -> dict[str, A
         inline_data = part.get("inline_data")
         pdf_bytes: bytes | None = None
 
-        if inline_data:
+        if part.get("pdf_bytes") is not None:
+            pdf_bytes = part.get("pdf_bytes")
+        elif inline_data:
             pdf_bytes = decode_base64url(inline_data)
         elif attachment_id:
             attachment_url = f"https://gmail.googleapis.com/gmail/v1/users/me/messages/{payload.message_id}/attachments/{attachment_id}"
@@ -1676,12 +1999,7 @@ def gmail_process(payload: GmailProcessRequest, request: Request) -> dict[str, A
             extracted_items.append({"filename": filename, "error": str(exc)})
 
     return {
-        "message": {
-            "id": payload.message_id,
-            "subject": headers.get("subject", "(no subject)"),
-            "from": headers.get("from", ""),
-            "date": headers.get("date", ""),
-        },
+        "message": message_meta,
         "attachments": extracted_items,
     }
 
@@ -1690,16 +2008,48 @@ def gmail_process(payload: GmailProcessRequest, request: Request) -> dict[str, A
 def gmail_process_free(payload: GmailProcessRequest, request: Request) -> dict[str, Any]:
     sid = request.cookies.get(GMAIL_COOKIE_NAME, "")
     session = GMAIL_OAUTH_SESSIONS.get(sid)
-    if not session or not session.get("access_token"):
-        raise HTTPException(401, "Not connected to Gmail.")
+    if not session:
+        raise HTTPException(401, "Not connected.")
 
-    detail_url = f"https://gmail.googleapis.com/gmail/v1/users/me/messages/{payload.message_id}?format=full"
-    detail = gmail_api_request(session, detail_url)
-    message_payload = detail.get("payload") or {}
-    headers = parse_header_map(message_payload.get("headers"))
-
+    mode = session.get("auth_mode") or "gmail_oauth"
+    headers: dict[str, str] = {}
     pdf_parts: list[dict[str, Any]] = []
-    collect_pdf_parts(message_payload, pdf_parts)
+    message_meta: dict[str, Any] = {"id": payload.message_id, "subject": "(no subject)", "from": "", "date": ""}
+
+    if mode == "imap":
+        cfg = imap_config_from_session(session)
+        client = imap_open(cfg)
+        try:
+            client.select("INBOX", readonly=True)
+            raw_bytes = imap_fetch_message_bytes(client, payload.message_id)
+            msg = BytesParser(policy=policy.default).parsebytes(raw_bytes)
+            message_meta["subject"] = str(msg.get("Subject", "(no subject)"))
+            message_meta["from"] = str(msg.get("From", ""))
+            message_meta["date"] = str(msg.get("Date", ""))
+            for part in collect_imap_pdf_parts(msg):
+                pdf_parts.append(
+                    {
+                        "filename": part["filename"],
+                        "pdf_bytes": part["bytes"],
+                    }
+                )
+        finally:
+            try:
+                client.logout()
+            except Exception:
+                pass
+    else:
+        if not session.get("access_token"):
+            raise HTTPException(401, "Not connected to Gmail.")
+        detail_url = f"https://gmail.googleapis.com/gmail/v1/users/me/messages/{payload.message_id}?format=full"
+        detail = gmail_api_request(session, detail_url)
+        message_payload = detail.get("payload") or {}
+        headers = parse_header_map(message_payload.get("headers"))
+        message_meta["subject"] = headers.get("subject", "(no subject)")
+        message_meta["from"] = headers.get("from", "")
+        message_meta["date"] = headers.get("date", "")
+        collect_pdf_parts(message_payload, pdf_parts)
+
     if not pdf_parts:
         raise HTTPException(400, "No PDF attachments found in this message.")
 
@@ -1710,7 +2060,9 @@ def gmail_process_free(payload: GmailProcessRequest, request: Request) -> dict[s
         inline_data = part.get("inline_data")
         pdf_bytes: bytes | None = None
 
-        if inline_data:
+        if part.get("pdf_bytes") is not None:
+            pdf_bytes = part.get("pdf_bytes")
+        elif inline_data:
             pdf_bytes = decode_base64url(inline_data)
         elif attachment_id:
             attachment_url = f"https://gmail.googleapis.com/gmail/v1/users/me/messages/{payload.message_id}/attachments/{attachment_id}"
@@ -1746,12 +2098,7 @@ def gmail_process_free(payload: GmailProcessRequest, request: Request) -> dict[s
             extracted_items.append({"filename": filename, "error": str(exc)})
 
     return {
-        "message": {
-            "id": payload.message_id,
-            "subject": headers.get("subject", "(no subject)"),
-            "from": headers.get("from", ""),
-            "date": headers.get("date", ""),
-        },
+        "message": message_meta,
         "attachments": extracted_items,
     }
 
@@ -1761,15 +2108,32 @@ def sheets_append(payload: SheetAppendRequest, request: Request) -> dict[str, An
     try:
         sid = request.cookies.get(GMAIL_COOKIE_NAME, "")
         session = GMAIL_OAUTH_SESSIONS.get(sid)
-        if not session or not session.get("access_token"):
+        if not session:
             raise HTTPException(401, "Not connected to Google.")
+        auth_mode = session.get("auth_mode") or "gmail_oauth"
+        has_oauth = bool(session.get("access_token"))
 
         sheet_id = extract_sheet_id(payload.sheet_id_or_url)
         sheet_gid = extract_sheet_gid(payload.sheet_id_or_url)
-        sheet_title = resolve_sheet_title(session, sheet_id, payload.sheet_name, sheet_gid)
         rows = to_sheet_rows(payload.attachments)
         if not rows:
             raise HTTPException(400, "No extracted attachment results to append.")
+
+        if has_oauth:
+            sheet_title = resolve_sheet_title(
+                sheet_id=sheet_id,
+                preferred_name=payload.sheet_name,
+                gid=sheet_gid,
+                session=session,
+            )
+        else:
+            sa_token = get_service_account_sheets_token()
+            sheet_title = resolve_sheet_title(
+                sheet_id=sheet_id,
+                preferred_name=payload.sheet_name,
+                gid=sheet_gid,
+                bearer_token=sa_token,
+            )
 
         target_range = f"{quote_sheet_title(sheet_title)}!A:J"
         encoded_range = urllib.parse.quote(target_range, safe="!:")
@@ -1777,13 +2141,24 @@ def sheets_append(payload: SheetAppendRequest, request: Request) -> dict[str, An
             f"https://sheets.googleapis.com/v4/spreadsheets/{sheet_id}/values/{encoded_range}:append"
             "?valueInputOption=USER_ENTERED&insertDataOption=INSERT_ROWS"
         )
-        resp = gmail_api_request(session, url, method="POST", body={"values": rows})
+        if has_oauth:
+            resp = gmail_api_request(session, url, method="POST", body={"values": rows})
+        else:
+            resp = google_api_request_with_bearer(sa_token, url, method="POST", body={"values": rows})
     except HTTPException as exc:
         msg = str(exc.detail)
         if "insufficientPermissions" in msg or "ACCESS_TOKEN_SCOPE_INSUFFICIENT" in msg:
             raise HTTPException(
                 403,
                 "Google Sheets permission missing. Please click Disconnect, then Sign in with Google again to grant Sheets access.",
+            ) from exc
+        if (
+            auth_mode == "imap"
+            and "IMAP mode push requires GOOGLE_SERVICE_ACCOUNT_JSON or GOOGLE_SERVICE_ACCOUNT_FILE" in msg
+        ):
+            raise HTTPException(
+                400,
+                "To push in IMAP mode, connect Google once (provider: Google OAuth) in the same browser session, or configure GOOGLE_SERVICE_ACCOUNT_FILE.",
             ) from exc
         raise
     except Exception as exc:

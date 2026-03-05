@@ -116,18 +116,31 @@
 <body>
 <div class="wrap">
   <section class="panel">
-    <h1>Gmail Delivery Order Extractor</h1>
-    <div class="sub">登录 Google 后，直接读取 Gmail 里的 DO PDF 并抽取为 JSON</div>
+    <h1>Email Delivery Order Extractor</h1>
+    <div class="sub">连接邮箱后，读取邮件中的 DO PDF 并抽取为 JSON</div>
     <div class="row" style="margin-top:12px">
-      <span class="pill" id="account-pill">未连接 Gmail</span>
-      <button class="primary" id="connect-btn">Sign in with Google</button>
+      <span class="pill" id="account-pill">未连接邮箱</span>
+      <select id="provider-select" title="Email source">
+        <option value="google_oauth">Google (OAuth)</option>
+        <option value="amazon_workmail">Amazon WorkMail (IMAP)</option>
+        <option value="outlook_imap">Outlook/Office365 (IMAP)</option>
+        <option value="yahoo_imap">Yahoo (IMAP)</option>
+        <option value="custom_imap">Custom IMAP</option>
+      </select>
+      <button class="primary" id="connect-btn">Connect Email Source</button>
       <button id="logout-btn" disabled>Disconnect</button>
+    </div>
+    <div class="row" style="margin-top:10px" id="imap-row">
+      <input id="imap-email" placeholder="IMAP Email (e.g. you@company.com)" style="max-width:260px">
+      <input id="imap-password" type="password" placeholder="IMAP Password / App Password" style="max-width:260px">
+      <input id="imap-host" placeholder="IMAP Host (e.g. imap.mail.us-west-2.awsapps.com)" style="max-width:330px">
+      <input id="imap-port" type="number" value="993" placeholder="993" style="max-width:100px">
     </div>
     <div class="status" id="session-status"></div>
   </section>
 
   <section class="panel">
-    <div class="sub" style="margin-bottom:8px">Gmail Search Query</div>
+    <div class="sub" style="margin-bottom:8px">Email Search Query</div>
     <div class="row">
       <input id="query-input" value='in:anywhere has:attachment (subject:(DO OR "delivery order" OR 提柜预报) OR filename:(DO OR Delivery_Order)) newer_than:1d'>
       <select id="limit-select" title="Number of emails to load">
@@ -165,6 +178,7 @@
     <div class="row" style="justify-content:space-between; margin-bottom:10px">
       <div class="sub">Extracted Result</div>
       <div class="row">
+        <button id="sheet-google-auth-btn">Connect Google Sheet</button>
         <button id="push-sheet-btn" disabled>Push To Sheet</button>
         <button id="raw-btn" disabled>Show Raw Text</button>
         <button id="copy-btn" disabled>Copy JSON</button>
@@ -175,6 +189,7 @@
       <input id="sheet-url-input" value="https://docs.google.com/spreadsheets/d/1FFaG6Y6scX1pZr-dTWnN1KBUGZKVhtPMw22OR3TFWF0/edit?gid=0#gid=0" placeholder="Google Sheet URL or Sheet ID">
       <input id="sheet-name-input" value="Sheet1" placeholder="Sheet name (tab)">
     </div>
+    <div class="sub" style="margin-bottom:8px;">提示：邮件来源可继续使用 IMAP；`Connect Google Sheet` 只用于写入表格授权。</div>
     <div class="row" style="margin-bottom:10px;">
       <input id="routing-input" value="pegaso=Sheet1, vail=Sheet2" placeholder="Routing rules: customer=sheet, e.g. pegaso=Sheet1, vail=Sheet2">
     </div>
@@ -352,9 +367,11 @@
   async function loadSession() {
     const data = await api("/gmail/session");
     const connected = !!data.authenticated;
-    document.getElementById("account-pill").textContent = connected ? ("Connected: " + (data.email || "")) : "未连接 Gmail";
+    const mode = data.mode || "";
+    const modeLabel = mode === "imap" ? "IMAP" : "Google";
+    document.getElementById("account-pill").textContent = connected ? ("Connected (" + modeLabel + "): " + (data.email || "")) : "未连接邮箱";
     document.getElementById("logout-btn").disabled = !connected;
-    setStatus("session-status", connected ? "已连接，可加载邮件。" : "请先登录 Google。", connected ? "ok" : "");
+    setStatus("session-status", connected ? "已连接，可加载邮件。" : "请先登录 Google 或连接 IMAP。", connected ? "ok" : "");
     return connected;
   }
 
@@ -365,6 +382,77 @@
     } catch (err) {
       setStatus("session-status", err.message, "err");
     }
+  }
+
+  async function connectGoogleSheet() {
+    try {
+      const data = await api("/gmail/auth/start");
+      window.location.href = data.auth_url;
+    } catch (err) {
+      setStatus("sheet-status", err.message, "err");
+    }
+  }
+
+  function providerConfig(provider) {
+    if (provider === "amazon_workmail") {
+      return { host: "imap.mail.us-west-2.awsapps.com", port: 993 };
+    }
+    if (provider === "outlook_imap") {
+      return { host: "outlook.office365.com", port: 993 };
+    }
+    if (provider === "yahoo_imap") {
+      return { host: "imap.mail.yahoo.com", port: 993 };
+    }
+    return { host: "", port: 993 };
+  }
+
+  function refreshProviderUI() {
+    const provider = document.getElementById("provider-select").value;
+    const imapRow = document.getElementById("imap-row");
+    const connectBtn = document.getElementById("connect-btn");
+    const isGoogle = provider === "google_oauth";
+    imapRow.style.display = isGoogle ? "none" : "flex";
+    connectBtn.textContent = isGoogle ? "Sign in Google Source" : "Connect IMAP Source";
+
+    if (!isGoogle) {
+      const cfg = providerConfig(provider);
+      if (cfg.host) {
+        document.getElementById("imap-host").value = cfg.host;
+      }
+      document.getElementById("imap-port").value = String(cfg.port || 993);
+    }
+  }
+
+  async function connectIMAP() {
+    const email = document.getElementById("imap-email").value.trim();
+    const password = document.getElementById("imap-password").value;
+    const host = document.getElementById("imap-host").value.trim();
+    const port = Number(document.getElementById("imap-port").value || "993");
+    if (!email || !password || !host) {
+      setStatus("session-status", "Please fill IMAP email/password/host.", "err");
+      return;
+    }
+    try {
+      setStatus("session-status", "Connecting IMAP...");
+      await api("/imap/connect", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ email, password, host, port })
+      });
+      setStatus("session-status", "IMAP connected.", "ok");
+      await loadSession();
+    } catch (err) {
+      setStatus("session-status", err.message, "err");
+    }
+  }
+
+  async function connectEmail() {
+    const provider = document.getElementById("provider-select").value;
+    if (provider === "google_oauth") {
+      await connectGoogle();
+      return;
+    }
+    await connectIMAP();
   }
 
   async function logoutGoogle() {
@@ -587,7 +675,9 @@
     btn.textContent = "Show Raw Text";
   }
 
-  document.getElementById("connect-btn").addEventListener("click", connectGoogle);
+  document.getElementById("connect-btn").addEventListener("click", connectEmail);
+  document.getElementById("provider-select").addEventListener("change", refreshProviderUI);
+  document.getElementById("sheet-google-auth-btn").addEventListener("click", connectGoogleSheet);
   document.getElementById("logout-btn").addEventListener("click", logoutGoogle);
   document.getElementById("load-btn").addEventListener("click", loadMessages);
   document.getElementById("sheet-url-input").addEventListener("change", () => {
@@ -614,6 +704,7 @@
   document.getElementById("copy-btn").addEventListener("click", copyJson);
   document.getElementById("download-btn").addEventListener("click", downloadJson);
 
+  refreshProviderUI();
   loadSession().catch((err) => setStatus("session-status", err.message, "err"));
   if (window.location.search.includes("connected=1")) {
     setStatus("session-status", "Google account connected.", "ok");
