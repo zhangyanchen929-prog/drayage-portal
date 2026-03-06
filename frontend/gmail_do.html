@@ -206,6 +206,7 @@
       <div class="card"><div class="label">Vessel</div><div class="value" id="s-vessel">-</div></div>
       <div class="card"><div class="label">Arrival</div><div class="value" id="s-arrival">-</div></div>
       <div class="card"><div class="label">Containers</div><div class="value" id="s-count">-</div></div>
+      <div class="card"><div class="label">Terminal</div><div class="value" id="s-terminal">-</div></div>
       <div class="card"><div class="label">Deliver To</div><div class="value" id="s-deliver">-</div></div>
       <div class="card"><div class="label">Weight KG</div><div class="value" id="s-weight">-</div></div>
     </div>
@@ -356,7 +357,7 @@
         <td><input type="checkbox" class="row-select-cb" data-mid="${row.id}" ${selectedMessageIds.has(row.id) ? "checked" : ""}></td>
         <td>${escapeHtml(row.subject || "")}<div class="sub">${escapeHtml(row.snippet || "")}</div></td>
         <td>${escapeHtml(row.from || "")}</td>
-        <td>${escapeHtml(row.date || "")}</td>
+        <td title="${escapeHtml(row.date || "")}">${escapeHtml(formatMailDate(row.date || ""))}</td>
         <td>${row.pdf_count || 0}<div class="sub">${escapeHtml((row.pdf_files || []).join(", "))}</div></td>
         <td>
           <div class="row">
@@ -425,6 +426,22 @@
     const el = document.getElementById(id);
     el.className = "status " + kind;
     el.textContent = msg;
+  }
+
+  function formatMailDate(raw) {
+    const text = String(raw || "").trim();
+    if (!text) return "";
+    const dt = new Date(text);
+    if (Number.isNaN(dt.getTime())) return text;
+    return dt.toLocaleString(undefined, {
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit",
+      hour: "2-digit",
+      minute: "2-digit",
+      second: "2-digit",
+      hour12: false
+    });
   }
 
   async function loadSession() {
@@ -588,6 +605,7 @@
     document.getElementById("s-vessel").textContent = ((d.shipment || {}).vessel_name) || "-";
     document.getElementById("s-arrival").textContent = ((d.shipment || {}).arrival_date) || "-";
     document.getElementById("s-count").textContent = containers.length + " container(s)";
+    document.getElementById("s-terminal").textContent = deriveTerminalDisplay(d);
     document.getElementById("s-deliver").textContent = ((d.deliver_to || {}).company) || "-";
     document.getElementById("s-weight").textContent = totalKg.toLocaleString() + " KG";
     document.getElementById("summary-grid").style.display = "grid";
@@ -602,9 +620,37 @@
       vessel: ((d.shipment || {}).vessel_name) || "-",
       arrival: ((d.shipment || {}).arrival_date) || "-",
       containers: `${containers.length} container(s)`,
+      terminal: deriveTerminalDisplay(d),
       deliver_to: ((d.deliver_to || {}).company) || "-",
       weight_kg: `${totalKg.toLocaleString()} KG`
     };
+  }
+
+  function deriveTerminalDisplay(deliveryOrder) {
+    const d = deliveryOrder || {};
+    const pickup = d.pick_up_from || {};
+    const shipment = d.shipment || {};
+    const sources = [
+      String(pickup.address || ""),
+      String(pickup.company || ""),
+      String(shipment.delivery_order_issued_to || "")
+    ];
+    for (const src of sources) {
+      const up = src.toUpperCase();
+      if (!up) continue;
+      const mPierBerth = up.match(/\b(PIER\s*[A-Z]\s*BERTH\s*[0-9/ -]+)\b/);
+      if (mPierBerth) return mPierBerth[1].replace(/\s+/g, " ").trim();
+      const mPier = up.match(/\b(PIER\s*[A-Z])\b/);
+      if (mPier) return mPier[1].replace(/\s+/g, " ").trim();
+      if (up.includes("LBCT")) return "LBCT";
+      if (up.includes("TRAPAC")) return "TRAPAC";
+      if (up.includes("EVERPORT")) return "EVERPORT";
+      if (up.includes("WBCT")) return "WBCT";
+      if (up.includes("YUSEN")) return "YUSEN";
+      if (/\bAPM\b/.test(up)) return "APM";
+      if (up.includes("TOTAL TERMINALS")) return "TOTAL TERMINALS INTL.";
+    }
+    return pickup.company || shipment.delivery_order_issued_to || "-";
   }
 
   function renderBatchSummaries(items) {
@@ -626,6 +672,7 @@
           <div class="card"><div class="label">Vessel</div><div class="value">${escapeHtml(it.vessel || "-")}</div></div>
           <div class="card"><div class="label">Arrival</div><div class="value">${escapeHtml(it.arrival || "-")}</div></div>
           <div class="card"><div class="label">Containers</div><div class="value">${escapeHtml(it.containers || "-")}</div></div>
+          <div class="card"><div class="label">Terminal</div><div class="value">${escapeHtml(it.terminal || "-")}</div></div>
           <div class="card"><div class="label">Deliver To</div><div class="value">${escapeHtml(it.deliver_to || "-")}</div></div>
           <div class="card"><div class="label">Weight KG</div><div class="value">${escapeHtml(it.weight_kg || "-")}</div></div>
         </div>
@@ -839,6 +886,7 @@
             vessel: "-",
             arrival: "-",
             containers: "-",
+            terminal: "-",
             deliver_to: "-",
             weight_kg: "-"
           });
@@ -876,6 +924,7 @@
             vessel: "-",
             arrival: "-",
             containers: "-",
+            terminal: "-",
             deliver_to: "-",
             weight_kg: "-"
           });

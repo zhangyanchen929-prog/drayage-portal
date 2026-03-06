@@ -10,6 +10,7 @@ from email.parser import BytesParser
 from email.utils import parsedate_to_datetime
 from datetime import datetime
 from datetime import timedelta
+from datetime import timezone
 import hashlib
 import json
 import os
@@ -540,9 +541,12 @@ def header_to_datetime(msg: Any) -> datetime | None:
         return None
     try:
         dt = parsedate_to_datetime(raw)
-        if dt and dt.tzinfo:
-            return dt.astimezone().replace(tzinfo=None)
-        return dt
+        if not dt:
+            return None
+        # Normalize to UTC-naive so comparisons with datetime.utcnow() are correct.
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc).replace(tzinfo=None)
     except Exception:
         return None
 
@@ -666,6 +670,56 @@ def to_sheet_rows(attachments: list[dict[str, Any]]) -> list[list[Any]]:
             return m2.group(1)
         return container_type or ""
 
+    def normalize_terminal_name(value: str) -> str:
+        t = re.sub(r"\s+", " ", (value or "").strip())
+        # Keep common terminal names clean, remove trailing internal code like "(Z952)".
+        t = re.sub(r"\s*\([A-Z0-9-]{2,}\)\s*$", "", t)
+        return t
+
+    def derive_terminal(shipment: dict[str, Any], pickup: dict[str, Any]) -> str:
+        pickup_company = str(pickup.get("company", "") or "").strip()
+        issued_to = str(shipment.get("delivery_order_issued_to", "") or "").strip()
+        pickup_addr = str(pickup.get("address", "") or "").strip()
+        sources = [pickup_addr, pickup_company, issued_to]
+
+        # Strong-rule first: address/company text patterns that map to known terminal names.
+        for src in sources:
+            up = src.upper()
+            if not up:
+                continue
+            m_pier_berth = re.search(r"\b(PIER\s*[A-Z]\s*BERTH\s*[0-9/ -]+)\b", up)
+            if m_pier_berth:
+                return re.sub(r"\s+", " ", m_pier_berth.group(1)).strip()
+            m_pier = re.search(r"\b(PIER\s*[A-Z])\b", up)
+            if m_pier:
+                return re.sub(r"\s+", " ", m_pier.group(1)).strip()
+            if "LBCT" in up:
+                return "LBCT"
+            if "TRAPAC" in up:
+                return "TRAPAC"
+            if "EVERPORT" in up:
+                return "EVERPORT"
+            if "WBCT" in up:
+                return "WBCT"
+            if "YUSEN" in up:
+                return "YUSEN"
+            if re.search(r"\bAPM\b", up):
+                return "APM"
+            if "TOTAL TERMINALS" in up:
+                return "TOTAL TERMINALS INTL."
+
+        terminal_kw = re.compile(r"(TERMINAL|PIER\s*[A-Z]?)", re.IGNORECASE)
+        for cand in sources:
+            if cand and terminal_kw.search(cand):
+                return normalize_terminal_name(cand)
+
+        # Fallbacks if no terminal pattern found.
+        if pickup_company:
+            return normalize_terminal_name(pickup_company)
+        if issued_to:
+            return normalize_terminal_name(issued_to)
+        return ""
+
     rows: list[list[Any]] = []
     for att in attachments:
         result = att.get("result") or {}
@@ -689,7 +743,7 @@ def to_sheet_rows(attachments: list[dict[str, Any]]) -> list[list[Any]]:
                     "YATES",                                # E WAREHOUSE
                     fmt_mmddyy(shipment.get("arrival_date", "")),  # F ETA
                     "",                                     # G LFD (reserved)
-                    pickup.get("company", ""),              # H TERMINAL
+                    derive_terminal(shipment, pickup),      # H TERMINAL
                     "",                                     # I Available (Y/N)
                     fmt_mmddyy(str(shipment.get("last_free_day") or "")),  # J LFD
                 ]
